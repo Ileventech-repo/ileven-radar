@@ -13,7 +13,7 @@ export type OpportunityCategory =
 
 export type LeadLabel = "HOT" | "WARM" | "LOW PRIORITY";
 
-export type SourceType = "rss" | "google_search";
+export type SourceType = "rss" | "google_search" | "linkedin";
 
 export interface SourceRecord {
   id: string;

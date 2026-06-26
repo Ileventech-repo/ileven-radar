@@ -1,5 +1,6 @@
 import { collectFromRssSource } from "../sources/rssSource";
 import { collectFromGoogleSearchSource } from "../sources/googleSearchSource";
+import { collectFromLinkedInSource } from "../sources/linkedinSource";
 import {
   listEnabledSources,
   markSourceOutcome,
@@ -17,9 +18,9 @@ async function collectFromSource(source: SourceRecord): Promise<RawItem[]> {
     case "rss":
       return collectFromRssSource(source);
     case "google_search":
-      // The Web Search Agent is just the google_search branch of the
-      // collector - same interface, different transport.
       return collectFromGoogleSearchSource(source);
+    case "linkedin":
+      return collectFromLinkedInSource(source);
     default:
       log.warn({ type: source.type }, "Unknown source type, skipping");
       return [];
