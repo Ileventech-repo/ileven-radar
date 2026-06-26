@@ -85,7 +85,7 @@ export function createApiServer() {
   // ---- Sources: create (add unlimited RSS feeds / search queries) ----
   const createSourceSchema = z.object({
     name: z.string().min(1),
-    type: z.enum(["rss", "google_search"]),
+    type: z.enum(["rss", "google_search", "linkedin"]),
     category: z.string().min(1),
     config: z.record(z.unknown()),
     enabled: z.boolean().optional(),
