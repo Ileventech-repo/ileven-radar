@@ -3,12 +3,16 @@ import { env } from "../config/env";
 import { childLogger } from "../config/logger";
 import { withRetry, sleep } from "../utils/retry";
 import {
+  esc,
   formatOpportunityLine,
   formatOpportunityMessage,
 } from "./format";
 import {
   deactivateSubscriber,
   getActiveSubscriberChatIds,
+  getChannelsForCategory,
+  listActiveChannels,
+  upsertChannel,
   upsertSubscriber,
 } from "./subscribers";
 import {
@@ -32,10 +36,28 @@ export function getBot(): TelegramBot {
   return bot;
 }
 
+async function sendToChat(chatId: number, message: string): Promise<void> {
+  try {
+    await withRetry(() => getBot().sendMessage(chatId, message, HTML), {
+      label: "Telegram send",
+      retries: 2,
+    });
+    await sleep(120);
+  } catch (err) {
+    const code = (err as { response?: { statusCode?: number } })?.response?.statusCode;
+    if (code === 403) {
+      await deactivateSubscriber(chatId);
+      log.info({ chatId }, "Subscriber blocked bot, deactivated");
+    } else {
+      log.error({ chatId, err: (err as Error).message }, "Failed to deliver lead");
+    }
+  }
+}
+
 /**
- * Telegram Notification Agent (push side): broadcasts every qualified,
- * not-yet-sent opportunity to all active subscribers, then marks it sent.
- * Sends sequentially with a small delay to stay within Telegram rate limits.
+ * Telegram Notification Agent (push side): routes every qualified,
+ * not-yet-sent opportunity to category-specific channels AND to all
+ * individual DM subscribers, then marks it sent.
  */
 export async function deliverQualifiedLeads(): Promise<number> {
   if (!bot) return 0;
@@ -43,38 +65,28 @@ export async function deliverQualifiedLeads(): Promise<number> {
   const leads = await getUnsentQualified(env.MIN_SCORE_TO_NOTIFY);
   if (leads.length === 0) return 0;
 
-  const chatIds = await getActiveSubscriberChatIds();
-  if (chatIds.length === 0) {
-    log.info({ leads: leads.length }, "Qualified leads ready but no active subscribers yet");
-    return 0;
-  }
+  const subscriberIds = await getActiveSubscriberChatIds();
 
   let delivered = 0;
   for (const lead of leads) {
     const message = formatOpportunityMessage(lead);
-    for (const chatId of chatIds) {
-      try {
-        await withRetry(() => getBot().sendMessage(chatId, message, HTML), {
-          label: "Telegram send",
-          retries: 2,
-        });
-        await sleep(120); // ~8 msgs/sec, safely under Telegram's limits
-      } catch (err) {
-        const code = (err as { response?: { statusCode?: number } })?.response?.statusCode;
-        // 403 = user blocked the bot; deactivate so we stop trying.
-        if (code === 403) {
-          await deactivateSubscriber(chatId);
-          log.info({ chatId }, "Subscriber blocked bot, deactivated");
-        } else {
-          log.error({ chatId, err: (err as Error).message }, "Failed to deliver lead");
-        }
-      }
+    const channelIds = await getChannelsForCategory(lead.category);
+
+    const allTargets = new Set([...channelIds, ...subscriberIds]);
+    if (allTargets.size === 0) {
+      log.info({ lead: lead.id }, "Qualified lead but no channels or subscribers");
+      continue;
     }
+
+    for (const chatId of allTargets) {
+      await sendToChat(chatId, message);
+    }
+
     await markTelegramSent(lead.id);
     delivered += 1;
   }
 
-  log.info({ delivered, subscribers: chatIds.length }, "Delivered qualified leads");
+  log.info({ delivered, channels: "by-category" }, "Delivered qualified leads");
   return delivered;
 }
 
@@ -95,6 +107,21 @@ async function sendList(
   await getBot().sendMessage(chatId, `<b>${title}</b>\n\n${lines.join("\n")}`, HTML);
 }
 
+const VALID_CATEGORIES = [
+  "all",
+  "Website Project",
+  "Mobile App Project",
+  "SaaS Project",
+  "AI Project",
+  "Government Tender",
+  "Startup Funding",
+  "Consulting Opportunity",
+  "Enterprise Software",
+  "Software Development",
+  "Freelance Project",
+  "Jobs & Projects",
+];
+
 const HELP_TEXT = `<b>Ileven Radar</b> — autonomous opportunity radar 🛰
 
 I scan tenders, RFPs, funding rounds, and "looking for a developer" posts every hour, score them with AI, and push the best leads here.
@@ -109,7 +136,12 @@ I scan tenders, RFPs, funding rounds, and "looking for a developer" posts every 
 /tenders — government tenders
 /websites — website projects
 /mobileapps — mobile app projects
-/search [keyword] — search all opportunities`;
+/search [keyword] — search all opportunities
+
+<b>Channel routing</b>
+/setchannel [category] — route a category to this channel
+/channels — list active channel mappings
+/categories — list available categories`;
 
 function registerCommands(b: TelegramBot): void {
   b.onText(/^\/start\b/, async (msg) => {
@@ -184,6 +216,53 @@ function registerCommands(b: TelegramBot): void {
     await sendList(msg.chat.id, `🔎 Results for "${keyword}"`, opps);
   });
 
+  b.onText(/^\/setchannel\b\s*(.*)$/, async (msg, match) => {
+    const category = (match?.[1] ?? "").trim();
+    if (!category) {
+      await b.sendMessage(
+        msg.chat.id,
+        `Usage: <code>/setchannel Government Tender</code>\n\nUse /categories to see available categories.\nUse <code>/setchannel all</code> to receive all categories.`,
+        HTML
+      );
+      return;
+    }
+    if (!VALID_CATEGORIES.includes(category)) {
+      await b.sendMessage(
+        msg.chat.id,
+        `❌ Unknown category: "${category}"\n\nUse /categories to see available categories.`,
+        HTML
+      );
+      return;
+    }
+    const chatTitle = msg.chat.title ?? msg.chat.username ?? String(msg.chat.id);
+    const channel = await upsertChannel(msg.chat.id, chatTitle, category);
+    await b.sendMessage(
+      msg.chat.id,
+      `✅ This chat is now receiving <b>${category}</b> opportunities.\n\nChannel: ${esc(channel.name)}`,
+      HTML
+    );
+    log.info({ chatId: msg.chat.id, category, name: chatTitle }, "Channel registered");
+  });
+
+  b.onText(/^\/channels\b/, async (msg) => {
+    const channels = await listActiveChannels();
+    if (channels.length === 0) {
+      await b.sendMessage(msg.chat.id, "No channels configured yet.\n\nUse /setchannel [category] in a group/channel to route opportunities there.", HTML);
+      return;
+    }
+    const lines = channels.map((c) => `• <b>${esc(c.category)}</b> → ${esc(c.name)}`);
+    await b.sendMessage(msg.chat.id, `<b>📡 Active channel routes</b>\n\n${lines.join("\n")}`, HTML);
+  });
+
+  b.onText(/^\/categories\b/, async (msg) => {
+    const lines = VALID_CATEGORIES.map((c) => `• <code>${c}</code>`);
+    await b.sendMessage(
+      msg.chat.id,
+      `<b>Available categories</b>\n\n${lines.join("\n")}\n\nUsage: <code>/setchannel Government Tender</code>`,
+      HTML
+    );
+  });
+
   b.on("polling_error", (err) => {
     log.error({ err: err.message }, "Telegram polling error");
   });
@@ -204,6 +283,9 @@ export async function startTelegramBot(): Promise<void> {
     { command: "websites", description: "Website projects" },
     { command: "mobileapps", description: "Mobile app projects" },
     { command: "search", description: "Search opportunities by keyword" },
+    { command: "setchannel", description: "Route a category to this chat" },
+    { command: "channels", description: "List active channel routes" },
+    { command: "categories", description: "List available categories" },
   ]);
 
   log.info("Telegram bot started (long polling)");

@@ -1,7 +1,7 @@
 import { OpportunityRecord } from "../types/opportunity";
 
 /** Escape characters that would break Telegram HTML parse mode. */
-function esc(value: string | null | undefined): string {
+export function esc(value: string | null | undefined): string {
   if (!value) return "—";
   return value
     .replace(/&/g, "&amp;")
