@@ -23,6 +23,14 @@ const envSchema = z.object({
   PROSPECT_MIN_SCORE: z.coerce.number().min(0).max(100).default(60),
   PROSPECT_CRON: z.string().default("0 8 * * *"), // daily at 8am
 
+  // Email / outreach
+  RESEND_API_KEY: z.string().optional().default(""),
+  FROM_EMAIL: z.string().optional().default("onboarding@resend.dev"),
+  COMPANY_NAME: z.string().optional().default("Our Agency"),
+  COMPANY_SERVICE: z.string().optional().default("professional web design and development services"),
+  COMPANY_CONTACT_EMAIL: z.string().optional().default(""),
+  COMPANY_WEBSITE: z.string().optional().default(""),
+
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
 
   MIN_SCORE_TO_NOTIFY: z.coerce.number().min(0).max(100).default(50),
@@ -50,3 +58,4 @@ export const googleSearchEnabled = Boolean(
 );
 
 export const placesEnabled = Boolean(env.GOOGLE_PLACES_API_KEY);
+export const emailEnabled = Boolean(env.RESEND_API_KEY);

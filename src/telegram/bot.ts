@@ -1,5 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
-import { env } from "../config/env";
+import { env, emailEnabled } from "../config/env";
 import { childLogger } from "../config/logger";
 import { withRetry, sleep } from "../utils/retry";
 import {
@@ -28,6 +28,9 @@ import {
   scanProspects,
   Prospect,
 } from "../agents/placesProspectorAgent";
+import { draftProspectEmail, draftOpportunityEmail } from "../agents/emailDraftAgent";
+import { sendEmail } from "../services/emailService";
+import { pool } from "../db/pool";
 
 const log = childLogger("TelegramAgent");
 
@@ -85,7 +88,27 @@ export async function deliverQualifiedLeads(): Promise<number> {
     }
 
     for (const chatId of allTargets) {
-      await sendToChat(chatId, message);
+      try {
+        const opts: TelegramBot.SendMessageOptions = { ...HTML };
+        const emailMatch = lead.contactInfo?.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+        if (emailEnabled && emailMatch) {
+          opts.reply_markup = {
+            inline_keyboard: [[
+              { text: "📧 Draft Proposal Email", callback_data: `draft_email:opportunity:${lead.id}:${emailMatch[0]}` },
+            ]],
+          };
+        }
+        await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram send", retries: 2 });
+        await sleep(120);
+      } catch (err) {
+        const code = (err as { response?: { statusCode?: number } })?.response?.statusCode;
+        if (code === 403) {
+          await deactivateSubscriber(chatId);
+          log.info({ chatId }, "Subscriber blocked bot, deactivated");
+        } else {
+          log.error({ chatId, err: (err as Error).message }, "Failed to deliver lead");
+        }
+      }
     }
 
     await markTelegramSent(lead.id);
@@ -134,13 +157,32 @@ export async function deliverUnsentProspects(): Promise<number> {
     const noSite = items.filter((p) => p.prospectType === "no_website").length;
     const badSite = items.filter((p) => p.prospectType === "bad_website").length;
     const header = `🌍 <b>Prospects — ${esc(groupKey)}</b>\nFound: ${noSite} no-website · ${badSite} bad-website\n`;
-    const body = items.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
-    const message = `${header}\n${body}`;
 
-    for (const chatId of chatIds) {
-      await sendToChat(chatId, message);
-    }
     for (const p of items) {
+      const message = `${header}\n${formatProspect(p, 1)}`;
+      for (const chatId of chatIds) {
+        try {
+          const opts: TelegramBot.SendMessageOptions = {
+            ...HTML,
+            disable_web_page_preview: false,
+          };
+          // Attach "Draft Email" button if we have a website (bad_website) contact to email
+          if (emailEnabled && p.website) {
+            const contactEmail = `webmaster@${new URL(p.website).hostname}`;
+            opts.reply_markup = {
+              inline_keyboard: [[
+                { text: "📧 Draft Proposal Email", callback_data: `draft_email:prospect:${p.placeId}:${contactEmail}` },
+              ]],
+            };
+          }
+          await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram prospect send", retries: 2 });
+          await sleep(120);
+        } catch (err) {
+          const code = (err as { response?: { statusCode?: number } })?.response?.statusCode;
+          if (code === 403) await deactivateSubscriber(chatId);
+          else log.error({ chatId, err: (err as Error).message }, "Failed to deliver prospect");
+        }
+      }
       await markProspectSent(p.placeId);
     }
     delivered += items.length;
@@ -148,6 +190,94 @@ export async function deliverUnsentProspects(): Promise<number> {
 
   log.info({ delivered }, "Delivered prospect alerts");
   return delivered;
+}
+
+// ---------------------------------------------------------------------------
+// Email approval flow
+// ---------------------------------------------------------------------------
+
+async function createEmailDraftRecord(
+  refType: "prospect" | "opportunity",
+  refId: string,
+  toEmail: string,
+  subject: string,
+  htmlBody: string,
+  plainBody: string,
+  chatId: number
+): Promise<string> {
+  const result = await pool.query<{ id: string }>(
+    `INSERT INTO email_outreach (ref_type, ref_id, to_email, subject, html_body, plain_body, telegram_chat_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [refType, refId, toEmail, subject, htmlBody, plainBody, chatId]
+  );
+  return result.rows[0].id;
+}
+
+export async function sendEmailApprovalRequest(
+  chatId: number,
+  refType: "prospect" | "opportunity",
+  refId: string,
+  toEmail: string,
+  label: string
+): Promise<void> {
+  if (!bot || !emailEnabled) return;
+
+  await bot.sendMessage(chatId, `⏳ Drafting email for <b>${esc(label)}</b>...`, HTML);
+
+  try {
+    let draft;
+    if (refType === "prospect") {
+      const result = await pool.query(
+        `SELECT place_id,name,address,phone,website,maps_url,business_type,location,prospect_type,perf_score,mobile_score,seo_score,pitch_reason FROM prospects WHERE place_id=$1`,
+        [refId]
+      );
+      const r = result.rows[0];
+      const prospect: Prospect = {
+        placeId: r.place_id, name: r.name, address: r.address, phone: r.phone,
+        website: r.website, mapsUrl: r.maps_url, businessType: r.business_type,
+        location: r.location, prospectType: r.prospect_type,
+        perfScore: r.perf_score, mobileScore: r.mobile_score, seoScore: r.seo_score,
+        pitchReason: r.pitch_reason,
+      };
+      draft = await draftProspectEmail(prospect, toEmail);
+    } else {
+      const result = await pool.query(
+        `SELECT id,source_name,source_category,url,raw_title,title,company,location,industry,budget_text,estimated_value_usd,deadline,contact_info,technologies,category,summary,recommended_action,opportunity_score,label,status,telegram_sent,created_at FROM opportunities WHERE id=$1`,
+        [refId]
+      );
+      const r = result.rows[0];
+      const opp: OpportunityRecord = {
+        id: r.id, sourceName: r.source_name, sourceCategory: r.source_category,
+        url: r.url, rawTitle: r.raw_title, title: r.title, company: r.company,
+        location: r.location, industry: r.industry, budgetText: r.budget_text,
+        estimatedValueUsd: r.estimated_value_usd ? Number(r.estimated_value_usd) : null,
+        deadline: r.deadline, contactInfo: r.contact_info,
+        technologies: r.technologies ?? [], category: r.category,
+        summary: r.summary, recommendedAction: r.recommended_action,
+        opportunityScore: r.opportunity_score, label: r.label,
+        status: r.status, telegramSent: r.telegram_sent, createdAt: r.created_at,
+      };
+      draft = await draftOpportunityEmail(opp, toEmail);
+    }
+
+    const draftId = await createEmailDraftRecord(
+      refType, refId, toEmail, draft.subject, draft.html, draft.plainText, chatId
+    );
+
+    const preview = `📧 <b>Email Draft</b>\n\n<b>To:</b> ${esc(toEmail)}\n<b>Subject:</b> ${esc(draft.subject)}\n\n${esc(draft.plainText.slice(0, 600))}${draft.plainText.length > 600 ? "..." : ""}`;
+
+    await bot.sendMessage(chatId, preview, {
+      ...HTML,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Send Now", callback_data: `email_send:${draftId}` },
+          { text: "❌ Cancel", callback_data: `email_cancel:${draftId}` },
+        ]],
+      },
+    });
+  } catch (err) {
+    await bot.sendMessage(chatId, `❌ Failed to draft email: ${esc((err as Error).message)}`, HTML);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +491,74 @@ function registerCommands(b: TelegramBot): void {
       `<b>Available categories</b>\n\n${lines.join("\n")}\n\nUsage: <code>/setchannel Government Tender</code>`,
       HTML
     );
+  });
+
+  // /email command: manually draft + send a service email
+  b.onText(/^\/email\b\s*(.*)$/, async (msg, match) => {
+    const input = (match?.[1] ?? "").trim();
+    if (!input || !input.includes("@")) {
+      await b.sendMessage(
+        msg.chat.id,
+        `Usage: <code>/email contact@business.com prospect:PLACE_ID</code>\nor: <code>/email contact@business.com opportunity:OPP_ID</code>\n\nThe agent will draft a personalized email and ask for your approval before sending.`,
+        HTML
+      );
+      return;
+    }
+    const parts = input.split(/\s+/);
+    const toEmail = parts[0];
+    const refPart = parts[1] ?? "";
+    const [refType, refId] = refPart.split(":") as ["prospect" | "opportunity", string];
+    if (!refId || !["prospect", "opportunity"].includes(refType)) {
+      await b.sendMessage(msg.chat.id, `❌ Invalid format. Use: <code>/email to@email.com prospect:ID</code>`, HTML);
+      return;
+    }
+    await sendEmailApprovalRequest(msg.chat.id, refType, refId, toEmail, toEmail);
+  });
+
+  // Callback queries: handle email send/cancel button presses
+  b.on("callback_query", async (query) => {
+    const data = query.data ?? "";
+    const chatId = query.message?.chat.id;
+    const msgId = query.message?.message_id;
+    if (!chatId) return;
+
+    if (data.startsWith("email_send:")) {
+      const draftId = data.replace("email_send:", "");
+      try {
+        const result = await pool.query(
+          `UPDATE email_outreach SET status='sent', sent_at=now() WHERE id=$1 AND status='pending' RETURNING to_email, subject, html_body`,
+          [draftId]
+        );
+        if (result.rows.length === 0) {
+          await b.answerCallbackQuery(query.id, { text: "Already processed." });
+          return;
+        }
+        const { to_email, subject, html_body } = result.rows[0];
+        const sent = await sendEmail({ to: to_email, subject, html: html_body });
+        if (sent) {
+          await b.editMessageText(`✅ Email sent to <b>${esc(to_email)}</b>\n<b>Subject:</b> ${esc(subject)}`, { chat_id: chatId, message_id: msgId, ...HTML });
+          await b.answerCallbackQuery(query.id, { text: "Email sent!" });
+        } else {
+          await b.answerCallbackQuery(query.id, { text: "Failed to send — check logs." });
+        }
+      } catch (err) {
+        log.error({ err: (err as Error).message }, "Email send via callback failed");
+        await b.answerCallbackQuery(query.id, { text: "Error sending email." });
+      }
+    } else if (data.startsWith("email_cancel:")) {
+      const draftId = data.replace("email_cancel:", "");
+      await pool.query(`UPDATE email_outreach SET status='cancelled' WHERE id=$1`, [draftId]);
+      await b.editMessageText("❌ Email cancelled.", { chat_id: chatId, message_id: msgId, ...HTML });
+      await b.answerCallbackQuery(query.id, { text: "Cancelled." });
+    } else if (data.startsWith("draft_email:")) {
+      // prospect:PLACE_ID:EMAIL or opportunity:OPP_ID:EMAIL
+      const parts = data.replace("draft_email:", "").split(":");
+      const refType = parts[0] as "prospect" | "opportunity";
+      const refId = parts[1];
+      const toEmail = parts.slice(2).join(":");
+      await b.answerCallbackQuery(query.id, { text: "Drafting email..." });
+      await sendEmailApprovalRequest(chatId, refType, refId, toEmail, toEmail);
+    }
   });
 
   b.on("polling_error", (err) => {
