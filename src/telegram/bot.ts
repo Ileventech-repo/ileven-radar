@@ -90,11 +90,14 @@ export async function deliverQualifiedLeads(): Promise<number> {
     for (const chatId of allTargets) {
       try {
         const opts: TelegramBot.SendMessageOptions = { ...HTML };
-        const emailMatch = lead.contactInfo?.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
-        if (emailEnabled && emailMatch) {
+        if (emailEnabled) {
+          const emailMatch = lead.contactInfo?.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+          const cbData = emailMatch
+            ? `draft_email:opportunity:${lead.id}:${emailMatch[0]}`
+            : `ask_email:opportunity:${lead.id}`;
           opts.reply_markup = {
             inline_keyboard: [[
-              { text: "📧 Draft Proposal Email", callback_data: `draft_email:opportunity:${lead.id}:${emailMatch[0]}` },
+              { text: "📧 Draft Proposal Email", callback_data: cbData },
             ]],
           };
         }
@@ -166,12 +169,13 @@ export async function deliverUnsentProspects(): Promise<number> {
             ...HTML,
             disable_web_page_preview: false,
           };
-          // Attach "Draft Email" button if we have a website (bad_website) contact to email
-          if (emailEnabled && p.website) {
-            const contactEmail = `webmaster@${new URL(p.website).hostname}`;
+          if (emailEnabled) {
+            const cbData = p.website
+              ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
+              : `ask_email:prospect:${p.placeId}`;
             opts.reply_markup = {
               inline_keyboard: [[
-                { text: "📧 Draft Proposal Email", callback_data: `draft_email:prospect:${p.placeId}:${contactEmail}` },
+                { text: "📧 Draft Proposal Email", callback_data: cbData },
               ]],
             };
           }
@@ -551,14 +555,60 @@ function registerCommands(b: TelegramBot): void {
       await b.editMessageText("❌ Email cancelled.", { chat_id: chatId, message_id: msgId, ...HTML });
       await b.answerCallbackQuery(query.id, { text: "Cancelled." });
     } else if (data.startsWith("draft_email:")) {
-      // prospect:PLACE_ID:EMAIL or opportunity:OPP_ID:EMAIL
       const parts = data.replace("draft_email:", "").split(":");
       const refType = parts[0] as "prospect" | "opportunity";
       const refId = parts[1];
       const toEmail = parts.slice(2).join(":");
       await b.answerCallbackQuery(query.id, { text: "Drafting email..." });
       await sendEmailApprovalRequest(chatId, refType, refId, toEmail, toEmail);
+    } else if (data.startsWith("ask_email:")) {
+      const parts = data.replace("ask_email:", "").split(":");
+      const refType = parts[0] as "prospect" | "opportunity";
+      const refId = parts[1];
+      await b.answerCallbackQuery(query.id, { text: "Enter email address" });
+      const sent = await b.sendMessage(
+        chatId,
+        `📧 Enter the recipient's email address for this ${refType}:`,
+        {
+          reply_markup: { force_reply: true, selective: true },
+        }
+      );
+      // Store pending context so we can pick it up when user replies
+      await pool.query(
+        `INSERT INTO email_outreach (ref_type, ref_id, to_email, subject, html_body, plain_body, status, telegram_chat_id, telegram_msg_id)
+         VALUES ($1,$2,'','','','','pending',$3,$4)`,
+        [refType, refId, chatId, sent.message_id]
+      );
     }
+  });
+
+  // Catch replies to force_reply email prompts
+  b.on("message", async (msg) => {
+    if (!msg.reply_to_message || !msg.text) return;
+    const repliedMsgId = msg.reply_to_message.message_id;
+    const chatId = msg.chat.id;
+
+    // Look up pending email outreach waiting for this reply
+    const result = await pool.query<{ id: string; ref_type: string; ref_id: string }>(
+      `SELECT id, ref_type, ref_id FROM email_outreach
+       WHERE status = 'pending' AND to_email = '' AND telegram_chat_id = $1 AND telegram_msg_id = $2`,
+      [chatId, repliedMsgId]
+    );
+    if (result.rows.length === 0) return;
+
+    const { id, ref_type, ref_id } = result.rows[0];
+    const emailInput = msg.text.trim();
+    if (!/^[\w.+-]+@[\w-]+\.[\w.]+$/.test(emailInput)) {
+      await b.sendMessage(chatId, `❌ That doesn't look like a valid email address. Please try again.`, HTML);
+      return;
+    }
+
+    // Update the record with the provided email
+    await pool.query(`UPDATE email_outreach SET to_email = $1 WHERE id = $2`, [emailInput, id]);
+    // Delete the placeholder so it doesn't interfere with normal flow
+    await pool.query(`DELETE FROM email_outreach WHERE id = $1`, [id]);
+
+    await sendEmailApprovalRequest(chatId, ref_type as "prospect" | "opportunity", ref_id, emailInput, emailInput);
   });
 
   b.on("polling_error", (err) => {
