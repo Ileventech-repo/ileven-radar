@@ -16,6 +16,7 @@ import {
 import { runPipeline } from "../scheduler/pipeline";
 import { runProspectCycle } from "../scheduler/prospectPipeline";
 import { scanProspects } from "../agents/placesProspectorAgent";
+import axios from "axios";
 
 const log = childLogger("Api");
 
@@ -167,6 +168,30 @@ export function createApiServer() {
   app.post("/api/prospect/run", async (_req, res) => {
     void runProspectCycle("api");
     res.status(202).json({ status: "started" });
+  });
+
+  // ---- Debug: test Places API key directly ----
+  app.get("/api/debug/places", async (req, res, next) => {
+    try {
+      const query = String(req.query.q ?? "hotel in Lagos Nigeria");
+      const key = env.GOOGLE_PLACES_API_KEY;
+      if (!key) return res.status(400).json({ error: "GOOGLE_PLACES_API_KEY not set" });
+      const response = await axios.get("https://maps.googleapis.com/maps/api/place/textsearch/json", {
+        params: { query, key },
+        timeout: 15_000,
+      });
+      const { status, results } = response.data;
+      res.json({
+        apiStatus: status,
+        keyConfigured: !!key,
+        resultsCount: results?.length ?? 0,
+        sample: (results ?? []).slice(0, 3).map((r: { name: string; formatted_address: string; place_id: string }) => ({
+          name: r.name,
+          address: r.formatted_address,
+          placeId: r.place_id,
+        })),
+      });
+    } catch (err) { next(err); }
   });
 
   // ---- Prospects: list ----
