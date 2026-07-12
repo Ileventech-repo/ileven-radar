@@ -1,5 +1,7 @@
 import { runAllProspectTargets } from "../agents/placesProspectorAgent";
 import { deliverUnsentProspects } from "../telegram/bot";
+import { enrichProspectsWithEmails } from "../services/contactFinderService";
+import { runPendingSequences } from "../services/sequenceService";
 import { childLogger } from "../config/logger";
 
 const log = childLogger("ProspectOrchestrator");
@@ -18,7 +20,9 @@ export async function runProspectCycle(trigger: string): Promise<void> {
   try {
     const found = await runAllProspectTargets();
     const delivered = await deliverUnsentProspects();
-    log.info({ trigger, found, delivered, durationMs: Date.now() - startedAt }, "Prospect cycle finished");
+    const enriched = await enrichProspectsWithEmails();
+    const followUpsSent = await runPendingSequences();
+    log.info({ trigger, found, delivered, enriched, followUpsSent, durationMs: Date.now() - startedAt }, "Prospect cycle finished");
   } catch (err) {
     log.error({ trigger, err: (err as Error).message }, "Prospect cycle errored");
   } finally {

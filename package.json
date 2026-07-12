@@ -17,6 +17,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@types/pdfkit": "^0.17.6",
     "axios": "^1.7.7",
     "cheerio": "^1.2.0",
     "dotenv": "^16.4.5",
@@ -24,11 +25,13 @@
     "node-cron": "^3.0.3",
     "node-telegram-bot-api": "^0.66.0",
     "openai": "^4.68.0",
+    "pdfkit": "^0.19.1",
     "pg": "^8.13.0",
     "pino": "^9.4.0",
     "pino-pretty": "^11.2.2",
     "resend": "^6.17.2",
     "rss-parser": "^3.13.0",
+    "twilio": "^6.0.2",
     "zod": "^3.23.8"
   },
   "devDependencies": {

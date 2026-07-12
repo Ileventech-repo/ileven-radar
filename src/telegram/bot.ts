@@ -1,5 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
-import { env, emailEnabled } from "../config/env";
+import { env, emailEnabled, whatsappEnabled } from "../config/env";
 import { childLogger } from "../config/logger";
 import { withRetry, sleep } from "../utils/retry";
 import {
@@ -30,6 +30,9 @@ import {
 } from "../agents/placesProspectorAgent";
 import { draftProspectEmail, draftOpportunityEmail } from "../agents/emailDraftAgent";
 import { sendEmail } from "../services/emailService";
+import { createFollowUpSequence } from "../services/sequenceService";
+import { draftAndSendWhatsApp } from "../services/whatsappService";
+import { generateProspectProposal, generateOpportunityProposal } from "../services/proposalPdfService";
 import { pool } from "../db/pool";
 
 const log = childLogger("TelegramAgent");
@@ -169,15 +172,18 @@ export async function deliverUnsentProspects(): Promise<number> {
             ...HTML,
             disable_web_page_preview: false,
           };
+          const buttons: TelegramBot.InlineKeyboardButton[] = [];
           if (emailEnabled) {
             const cbData = p.website
               ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
               : `ask_email:prospect:${p.placeId}`;
-            opts.reply_markup = {
-              inline_keyboard: [[
-                { text: "📧 Draft Proposal Email", callback_data: cbData },
-              ]],
-            };
+            buttons.push({ text: "📧 Draft Email", callback_data: cbData });
+          }
+          if (whatsappEnabled && p.phone) {
+            buttons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
+          }
+          if (buttons.length > 0) {
+            opts.reply_markup = { inline_keyboard: [buttons] };
           }
           await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram prospect send", retries: 2 });
           await sleep(120);
@@ -273,10 +279,15 @@ export async function sendEmailApprovalRequest(
     await bot.sendMessage(chatId, preview, {
       ...HTML,
       reply_markup: {
-        inline_keyboard: [[
-          { text: "✅ Send Now", callback_data: `email_send:${draftId}` },
-          { text: "❌ Cancel", callback_data: `email_cancel:${draftId}` },
-        ]],
+        inline_keyboard: [
+          [
+            { text: "✅ Send Email", callback_data: `email_send:${draftId}` },
+            { text: "📎 Send with PDF", callback_data: `email_send_pdf:${draftId}` },
+          ],
+          [
+            { text: "❌ Cancel", callback_data: `email_cancel:${draftId}` },
+          ],
+        ],
       },
     });
   } catch (err) {
@@ -526,25 +537,87 @@ function registerCommands(b: TelegramBot): void {
     const msgId = query.message?.message_id;
     if (!chatId) return;
 
-    if (data.startsWith("email_send:")) {
-      const draftId = data.replace("email_send:", "");
+    if (data.startsWith("email_send:") || data.startsWith("email_send_pdf:")) {
+      const withPdf = data.startsWith("email_send_pdf:");
+      const draftId = data.replace(withPdf ? "email_send_pdf:" : "email_send:", "");
       try {
-        const result = await pool.query(
-          `UPDATE email_outreach SET status='sent', sent_at=now() WHERE id=$1 AND status='pending' RETURNING to_email, subject, html_body`,
+        const result = await pool.query<{
+          to_email: string; subject: string; html_body: string;
+          ref_type: string; ref_id: string;
+        }>(
+          `UPDATE email_outreach SET status='sent', sent_at=now() WHERE id=$1 AND status='pending'
+           RETURNING to_email, subject, html_body, ref_type, ref_id`,
           [draftId]
         );
         if (result.rows.length === 0) {
           await b.answerCallbackQuery(query.id, { text: "Already processed." });
           return;
         }
-        const { to_email, subject, html_body } = result.rows[0];
-        const sent = await sendEmail({ to: to_email, subject, html: html_body });
-        if (sent) {
-          await b.editMessageText(`✅ Email sent to <b>${esc(to_email)}</b>\n<b>Subject:</b> ${esc(subject)}`, { chat_id: chatId, message_id: msgId, ...HTML });
-          await b.answerCallbackQuery(query.id, { text: "Email sent!" });
-        } else {
-          await b.answerCallbackQuery(query.id, { text: "Failed to send — check logs." });
+        const { to_email, subject, html_body, ref_type, ref_id } = result.rows[0];
+
+        let pdfBuffer: Buffer | undefined;
+        if (withPdf) {
+          try {
+            if (ref_type === "prospect") {
+              const pr = await pool.query(`SELECT * FROM prospects WHERE place_id=$1`, [ref_id]);
+              if (pr.rows[0]) {
+                const p = pr.rows[0];
+                pdfBuffer = await generateProspectProposal({
+                  placeId: p.place_id, name: p.name, address: p.address, phone: p.phone,
+                  website: p.website, mapsUrl: p.maps_url, businessType: p.business_type,
+                  location: p.location, prospectType: p.prospect_type,
+                  perfScore: p.perf_score, mobileScore: p.mobile_score, seoScore: p.seo_score,
+                  pitchReason: p.pitch_reason,
+                });
+              }
+            } else {
+              const or = await pool.query(`SELECT * FROM opportunities WHERE id=$1`, [ref_id]);
+              if (or.rows[0]) {
+                const o = or.rows[0];
+                pdfBuffer = await generateOpportunityProposal({
+                  id: o.id, sourceName: o.source_name, sourceCategory: o.source_category,
+                  url: o.url, rawTitle: o.raw_title, title: o.title, company: o.company,
+                  location: o.location, industry: o.industry, budgetText: o.budget_text,
+                  estimatedValueUsd: o.estimated_value_usd ? Number(o.estimated_value_usd) : null,
+                  deadline: o.deadline, contactInfo: o.contact_info,
+                  technologies: o.technologies ?? [], category: o.category,
+                  summary: o.summary, recommendedAction: o.recommended_action,
+                  opportunityScore: o.opportunity_score, label: o.label,
+                  status: o.status, telegramSent: o.telegram_sent, createdAt: o.created_at,
+                });
+              }
+            }
+          } catch (pdfErr) {
+            log.error({ err: (pdfErr as Error).message }, "PDF generation failed, sending without PDF");
+          }
         }
+
+        const { Resend } = await import("resend");
+        const resendClient = new (Resend as unknown as { new(key: string): { emails: { send: (o: object) => Promise<unknown> } } })(env.RESEND_API_KEY);
+        const emailPayload: Record<string, unknown> = {
+          from: env.FROM_EMAIL,
+          to: to_email,
+          subject,
+          html: html_body,
+          replyTo: env.COMPANY_CONTACT_EMAIL || undefined,
+        };
+        if (pdfBuffer) {
+          emailPayload.attachments = [{
+            filename: `${env.COMPANY_NAME.replace(/\s+/g, "_")}_Proposal.pdf`,
+            content: pdfBuffer.toString("base64"),
+          }];
+        }
+        await resendClient.emails.send(emailPayload);
+
+        // Create follow-up sequence
+        await createFollowUpSequence(draftId, ref_type as "prospect" | "opportunity", ref_id, to_email);
+
+        const pdfNote = pdfBuffer ? " (with PDF proposal)" : "";
+        await b.editMessageText(
+          `✅ Email sent to <b>${esc(to_email)}</b>${pdfNote}\n<b>Subject:</b> ${esc(subject)}\n\n📅 Follow-up emails scheduled for Day 3 and Day 7.`,
+          { chat_id: chatId, message_id: msgId, ...HTML }
+        );
+        await b.answerCallbackQuery(query.id, { text: `Email sent${pdfNote}!` });
       } catch (err) {
         log.error({ err: (err as Error).message }, "Email send via callback failed");
         await b.answerCallbackQuery(query.id, { text: "Error sending email." });
@@ -554,6 +627,32 @@ function registerCommands(b: TelegramBot): void {
       await pool.query(`UPDATE email_outreach SET status='cancelled' WHERE id=$1`, [draftId]);
       await b.editMessageText("❌ Email cancelled.", { chat_id: chatId, message_id: msgId, ...HTML });
       await b.answerCallbackQuery(query.id, { text: "Cancelled." });
+    } else if (data.startsWith("whatsapp_send:")) {
+      const parts = data.replace("whatsapp_send:", "").split(":");
+      const placeId = parts[0];
+      const phone = parts.slice(1).join(":");
+      await b.answerCallbackQuery(query.id, { text: "Sending WhatsApp..." });
+      try {
+        const pr = await pool.query(`SELECT * FROM prospects WHERE place_id=$1`, [placeId]);
+        if (pr.rows[0]) {
+          const p = pr.rows[0];
+          const prospect: Prospect = {
+            placeId: p.place_id, name: p.name, address: p.address, phone: p.phone,
+            website: p.website, mapsUrl: p.maps_url, businessType: p.business_type,
+            location: p.location, prospectType: p.prospect_type,
+            perfScore: p.perf_score, mobileScore: p.mobile_score, seoScore: p.seo_score,
+            pitchReason: p.pitch_reason,
+          };
+          const { message, sent } = await draftAndSendWhatsApp(prospect, phone);
+          if (sent) {
+            await b.editMessageText(`✅ WhatsApp sent to ${esc(phone)}\n\n<i>${esc(message)}</i>`, { chat_id: chatId, message_id: msgId, ...HTML });
+          } else {
+            await b.editMessageText(`❌ WhatsApp failed to send to ${esc(phone)}`, { chat_id: chatId, message_id: msgId, ...HTML });
+          }
+        }
+      } catch (err) {
+        log.error({ err: (err as Error).message }, "WhatsApp send failed");
+      }
     } else if (data.startsWith("draft_email:")) {
       const parts = data.replace("draft_email:", "").split(":");
       const refType = parts[0] as "prospect" | "opportunity";

@@ -31,6 +31,14 @@ const envSchema = z.object({
   COMPANY_CONTACT_EMAIL: z.string().optional().default(""),
   COMPANY_WEBSITE: z.string().optional().default(""),
 
+  // Contact finder
+  HUNTER_API_KEY: z.string().optional().default(""),
+
+  // WhatsApp (Twilio)
+  TWILIO_ACCOUNT_SID: z.string().optional().default(""),
+  TWILIO_AUTH_TOKEN: z.string().optional().default(""),
+  TWILIO_WHATSAPP_NUMBER: z.string().optional().default(""), // e.g. whatsapp:+14155238886
+
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
 
   MIN_SCORE_TO_NOTIFY: z.coerce.number().min(0).max(100).default(50),
@@ -59,3 +67,5 @@ export const googleSearchEnabled = Boolean(
 
 export const placesEnabled = Boolean(env.GOOGLE_PLACES_API_KEY);
 export const emailEnabled = Boolean(env.RESEND_API_KEY);
+export const hunterEnabled = Boolean(env.HUNTER_API_KEY);
+export const whatsappEnabled = Boolean(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_WHATSAPP_NUMBER);
