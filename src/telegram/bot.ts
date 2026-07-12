@@ -22,6 +22,12 @@ import {
   queryOpportunities,
 } from "../services/opportunityRepository";
 import { OpportunityRecord } from "../types/opportunity";
+import {
+  getUnsentProspects,
+  markProspectSent,
+  scanProspects,
+  Prospect,
+} from "../agents/placesProspectorAgent";
 
 const log = childLogger("TelegramAgent");
 
@@ -90,6 +96,60 @@ export async function deliverQualifiedLeads(): Promise<number> {
   return delivered;
 }
 
+function formatProspect(p: Prospect, index: number): string {
+  const typeLabel = p.prospectType === "no_website" ? "🚫 NO WEBSITE" : "⚠️ BAD WEBSITE";
+  const lines = [
+    `${index}. ${typeLabel}`,
+    `<b>${esc(p.name)}</b>`,
+    `📍 ${esc(p.address)}`,
+  ];
+  if (p.phone) lines.push(`📞 ${esc(p.phone)}`);
+  if (p.website) lines.push(`🌐 ${esc(p.website)}`);
+  if (p.prospectType === "bad_website" && p.perfScore !== undefined) {
+    lines.push(`📊 Speed: ${p.perfScore} | Mobile: ${p.mobileScore} | SEO: ${p.seoScore}`);
+  }
+  if (p.mapsUrl) lines.push(`🗺 <a href="${esc(p.mapsUrl)}">Google Maps</a>`);
+  lines.push(`💡 ${esc(p.pitchReason)}`);
+  return lines.join("\n");
+}
+
+export async function deliverUnsentProspects(): Promise<number> {
+  if (!bot) return 0;
+  const prospects = await getUnsentProspects();
+  if (prospects.length === 0) return 0;
+
+  const chatIds = await getActiveSubscriberChatIds();
+  if (chatIds.length === 0) return 0;
+
+  // Group by location for cleaner messages
+  const groups = new Map<string, Prospect[]>();
+  for (const p of prospects) {
+    const key = `${p.businessType} | ${p.location}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(p);
+  }
+
+  let delivered = 0;
+  for (const [groupKey, items] of groups) {
+    const noSite = items.filter((p) => p.prospectType === "no_website").length;
+    const badSite = items.filter((p) => p.prospectType === "bad_website").length;
+    const header = `🌍 <b>Prospects — ${esc(groupKey)}</b>\nFound: ${noSite} no-website · ${badSite} bad-website\n`;
+    const body = items.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
+    const message = `${header}\n${body}`;
+
+    for (const chatId of chatIds) {
+      await sendToChat(chatId, message);
+    }
+    for (const p of items) {
+      await markProspectSent(p.placeId);
+    }
+    delivered += items.length;
+  }
+
+  log.info({ delivered }, "Delivered prospect alerts");
+  return delivered;
+}
+
 // ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
@@ -141,7 +201,10 @@ I scan tenders, RFPs, funding rounds, and "looking for a developer" posts every 
 <b>Channel routing</b>
 /setchannel [category] — route a category to this channel
 /channels — list active channel mappings
-/categories — list available categories`;
+/categories — list available categories
+
+<b>Prospect scanner</b>
+/prospect [type] in [location] — scan for businesses with no/bad website`;
 
 function registerCommands(b: TelegramBot): void {
   b.onText(/^\/start\b/, async (msg) => {
@@ -216,6 +279,43 @@ function registerCommands(b: TelegramBot): void {
     await sendList(msg.chat.id, `🔎 Results for "${keyword}"`, opps);
   });
 
+  b.onText(/^\/prospect\b\s*(.*)$/, async (msg, match) => {
+    const input = (match?.[1] ?? "").trim();
+    if (!input) {
+      await b.sendMessage(
+        msg.chat.id,
+        `Usage: <code>/prospect hotels in Lagos</code>\n<code>/prospect restaurants in London, UK</code>\n\nScans Google Places for businesses with no website or a bad website.`,
+        HTML
+      );
+      return;
+    }
+    // Parse "type in location" or just "type location"
+    const inMatch = input.match(/^(.+?)\s+in\s+(.+)$/i);
+    const businessType = inMatch ? inMatch[1].trim() : input.split(" ").slice(0, -1).join(" ") || input;
+    const location = inMatch ? inMatch[2].trim() : input.split(" ").slice(-1)[0] || "Nigeria";
+
+    await b.sendMessage(
+      msg.chat.id,
+      `🔍 Scanning <b>${esc(businessType)}</b> in <b>${esc(location)}</b>...\nThis takes 1-2 minutes.`,
+      HTML
+    );
+
+    try {
+      const prospects = await scanProspects(businessType, location);
+      if (prospects.length === 0) {
+        await b.sendMessage(msg.chat.id, `✅ Scan complete — no new prospects found in ${esc(location)}.`, HTML);
+        return;
+      }
+      const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
+      const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
+      const header = `✅ <b>Scan complete — ${esc(businessType)} in ${esc(location)}</b>\n${noSite} no-website · ${badSite} bad-website\n`;
+      const body = prospects.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
+      await b.sendMessage(msg.chat.id, `${header}\n${body}`, { ...HTML, disable_web_page_preview: false });
+    } catch (err) {
+      await b.sendMessage(msg.chat.id, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
+    }
+  });
+
   b.onText(/^\/setchannel\b\s*(.*)$/, async (msg, match) => {
     const category = (match?.[1] ?? "").trim();
     if (!category) {
@@ -286,6 +386,7 @@ export async function startTelegramBot(): Promise<void> {
     { command: "setchannel", description: "Route a category to this chat" },
     { command: "channels", description: "List active channel routes" },
     { command: "categories", description: "List available categories" },
+    { command: "prospect", description: "Scan businesses with no/bad website" },
   ]);
 
   log.info("Telegram bot started (long polling)");

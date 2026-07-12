@@ -14,6 +14,8 @@ import {
   setSourceEnabled,
 } from "../sources/registry";
 import { runPipeline } from "../scheduler/pipeline";
+import { runProspectCycle } from "../scheduler/prospectPipeline";
+import { scanProspects } from "../agents/placesProspectorAgent";
 
 const log = childLogger("Api");
 
@@ -115,10 +117,73 @@ export function createApiServer() {
     }
   });
 
-  // ---- Manual pipeline trigger (handy for testing without waiting for cron) ----
+  // ---- Manual pipeline trigger ----
   app.post("/api/run", async (_req, res) => {
     void runPipeline("api");
     res.status(202).json({ status: "started" });
+  });
+
+  // ---- Prospect targets: list ----
+  app.get("/api/prospect/targets", async (_req, res, next) => {
+    try {
+      const result = await pool.query(
+        "SELECT id, business_type, location, enabled, last_run_at FROM prospect_targets ORDER BY created_at ASC"
+      );
+      res.json({ targets: result.rows });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Prospect targets: add ----
+  const prospectTargetSchema = z.object({
+    businessType: z.string().min(1),
+    location: z.string().min(1),
+  });
+
+  app.post("/api/prospect/targets", async (req, res, next) => {
+    try {
+      const parsed = prospectTargetSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+      await pool.query(
+        `INSERT INTO prospect_targets (business_type, location) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [parsed.data.businessType, parsed.data.location]
+      );
+      res.status(201).json({ status: "added", ...parsed.data });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Prospect: manual scan ----
+  app.post("/api/prospect/scan", async (req, res, next) => {
+    try {
+      const { businessType, location } = req.body ?? {};
+      if (!businessType || !location) {
+        return res.status(400).json({ error: "businessType and location are required" });
+      }
+      const prospects = await scanProspects(String(businessType), String(location));
+      res.json({ found: prospects.length, prospects });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Prospect: run all targets now ----
+  app.post("/api/prospect/run", async (_req, res) => {
+    void runProspectCycle("api");
+    res.status(202).json({ status: "started" });
+  });
+
+  // ---- Prospects: list ----
+  app.get("/api/prospects", async (req, res, next) => {
+    try {
+      const type = req.query.type as string | undefined;
+      const limit = Math.min(100, Number(req.query.limit ?? 20));
+      const params: unknown[] = [];
+      const conds: string[] = [];
+      if (type) { params.push(type); conds.push(`prospect_type = $${params.length}`); }
+      params.push(limit);
+      const result = await pool.query(
+        `SELECT * FROM prospects ${conds.length ? "WHERE " + conds.join(" AND ") : ""} ORDER BY created_at DESC LIMIT $${params.length}`,
+        params
+      );
+      res.json({ count: result.rows.length, prospects: result.rows });
+    } catch (err) { next(err); }
   });
 
   // ---- Error handler ----

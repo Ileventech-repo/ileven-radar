@@ -18,6 +18,10 @@ const envSchema = z.object({
 
   GOOGLE_CSE_API_KEY: z.string().optional().default(""),
   GOOGLE_CSE_ID: z.string().optional().default(""),
+  GOOGLE_PLACES_API_KEY: z.string().optional().default(""),
+
+  PROSPECT_MIN_SCORE: z.coerce.number().min(0).max(100).default(60),
+  PROSPECT_CRON: z.string().default("0 8 * * *"), // daily at 8am
 
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
 
@@ -44,3 +48,5 @@ export const env = parsed.data;
 export const googleSearchEnabled = Boolean(
   env.GOOGLE_CSE_API_KEY && env.GOOGLE_CSE_ID
 );
+
+export const placesEnabled = Boolean(env.GOOGLE_PLACES_API_KEY);
