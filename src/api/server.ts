@@ -15,7 +15,7 @@ import {
 } from "../sources/registry";
 import { runPipeline } from "../scheduler/pipeline";
 import { runProspectCycle } from "../scheduler/prospectPipeline";
-import { scanProspects } from "../agents/placesProspectorAgent";
+import { scanProspects, scanLocation } from "../agents/placesProspectorAgent";
 import axios from "axios";
 
 const log = childLogger("Api");
@@ -161,6 +161,16 @@ export function createApiServer() {
       }
       const prospects = await scanProspects(String(businessType), String(location));
       res.json({ found: prospects.length, prospects });
+    } catch (err) { next(err); }
+  });
+
+  // ---- Prospect: scan all business types in a location ----
+  app.post("/api/prospect/scan-location", async (req, res, next) => {
+    try {
+      const { location, businessTypes } = req.body ?? {};
+      if (!location) return res.status(400).json({ error: "location is required" });
+      const prospects = await scanLocation(String(location), businessTypes);
+      res.json({ location, found: prospects.length, prospects });
     } catch (err) { next(err); }
   });
 

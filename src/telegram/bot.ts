@@ -26,6 +26,7 @@ import {
   getUnsentProspects,
   markProspectSent,
   scanProspects,
+  scanLocation,
   Prospect,
 } from "../agents/placesProspectorAgent";
 import { draftProspectEmail, draftOpportunityEmail } from "../agents/emailDraftAgent";
@@ -349,7 +350,8 @@ I scan tenders, RFPs, funding rounds, and "looking for a developer" posts every 
 /categories — list available categories
 
 <b>Prospect scanner</b>
-/prospect [type] in [location] — scan for businesses with no/bad website`;
+/prospect [type] in [location] — scan one business type in a location
+/scan [location] — scan ALL business types in a location (full sweep)`;
 
 function registerCommands(b: TelegramBot): void {
   b.onText(/^\/start\b/, async (msg) => {
@@ -456,6 +458,57 @@ function registerCommands(b: TelegramBot): void {
       const header = `✅ <b>Scan complete — ${esc(businessType)} in ${esc(location)}</b>\n${noSite} no-website · ${badSite} bad-website\n`;
       const body = prospects.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
       await b.sendMessage(msg.chat.id, `${header}\n${body}`, { ...HTML, disable_web_page_preview: false });
+    } catch (err) {
+      await b.sendMessage(msg.chat.id, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
+    }
+  });
+
+  b.onText(/^\/scan\b\s*(.*)$/, async (msg, match) => {
+    const location = (match?.[1] ?? "").trim();
+    if (!location) {
+      await b.sendMessage(
+        msg.chat.id,
+        `Usage: <code>/scan Lagos, Nigeria</code>\n<code>/scan London, UK</code>\n\nScans 14 business types in that location for businesses with no website or a bad website.`,
+        HTML
+      );
+      return;
+    }
+    await b.sendMessage(
+      msg.chat.id,
+      `🌍 Scanning <b>all business types</b> in <b>${esc(location)}</b>...\nThis may take 5-10 minutes. I'll message you when done.`,
+      HTML
+    );
+    try {
+      const prospects = await scanLocation(location);
+      const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
+      const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
+      if (prospects.length === 0) {
+        await b.sendMessage(msg.chat.id, `✅ Scan of <b>${esc(location)}</b> complete — no new prospects found.`, HTML);
+        return;
+      }
+      await b.sendMessage(
+        msg.chat.id,
+        `✅ <b>Location scan complete — ${esc(location)}</b>\n\n🚫 No-website: <b>${noSite}</b>\n⚠️ Bad-website: <b>${badSite}</b>\nTotal: <b>${prospects.length}</b>\n\nProspects are being sent to you now...`,
+        HTML
+      );
+      // Deliver immediately to this chat
+      for (const p of prospects) {
+        const message = formatProspect(p, 1);
+        const opts: TelegramBot.SendMessageOptions = { ...HTML };
+        const buttons: TelegramBot.InlineKeyboardButton[] = [];
+        if (emailEnabled) {
+          const cbData = p.website
+            ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
+            : `ask_email:prospect:${p.placeId}`;
+          buttons.push({ text: "📧 Draft Email", callback_data: cbData });
+        }
+        if (whatsappEnabled && p.phone) {
+          buttons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
+        }
+        if (buttons.length > 0) opts.reply_markup = { inline_keyboard: [buttons] };
+        await b.sendMessage(msg.chat.id, message, opts);
+        await sleep(200);
+      }
     } catch (err) {
       await b.sendMessage(msg.chat.id, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
     }

@@ -222,6 +222,26 @@ export async function scanProspects(
   return results;
 }
 
+export const SCAN_BUSINESS_TYPES = [
+  "hotel", "restaurant", "law firm", "clinic", "dental clinic",
+  "real estate agency", "school", "spa", "gym", "pharmacy",
+  "accounting firm", "car dealership", "boutique", "logistics company",
+];
+
+export async function scanLocation(location: string, businessTypes = SCAN_BUSINESS_TYPES): Promise<Prospect[]> {
+  const all: Prospect[] = [];
+  for (const type of businessTypes) {
+    try {
+      const found = await scanProspects(type, location);
+      all.push(...found);
+      await sleep(500);
+    } catch (err) {
+      log.error({ err: (err as Error).message, type, location }, "scanLocation: type scan failed");
+    }
+  }
+  return all;
+}
+
 export async function runAllProspectTargets(): Promise<number> {
   const targets = await pool.query<{ business_type: string; location: string }>(
     "SELECT business_type, location FROM prospect_targets WHERE enabled = TRUE ORDER BY last_run_at ASC NULLS FIRST"
