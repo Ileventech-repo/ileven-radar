@@ -30,6 +30,7 @@ import {
   Prospect,
 } from "../agents/placesProspectorAgent";
 import { draftProspectEmail, draftOpportunityEmail } from "../agents/emailDraftAgent";
+import { buildProspectCallScript, buildOpportunityCallScript, formatCallScript } from "../agents/callScriptAgent";
 import { sendEmail } from "../services/emailService";
 import { createFollowUpSequence } from "../services/sequenceService";
 import { draftAndSendWhatsApp } from "../services/whatsappService";
@@ -103,17 +104,17 @@ export async function deliverQualifiedLeads(): Promise<number> {
     for (const chatId of allTargets) {
       try {
         const opts: TelegramBot.SendMessageOptions = { ...HTML };
+        const emailMatch = lead.contactInfo?.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
+        const emailCb = emailMatch
+          ? `draft_email:opportunity:${lead.id}:${emailMatch[0]}`
+          : `ask_email:opportunity:${lead.id}`;
+        const buttons: TelegramBot.InlineKeyboardButton[] = [
+          { text: "📞 Call Script", callback_data: `call_script:opportunity:${lead.id}` },
+        ];
         if (emailEnabled) {
-          const emailMatch = lead.contactInfo?.match(/[\w.+-]+@[\w-]+\.[\w.]+/);
-          const cbData = emailMatch
-            ? `draft_email:opportunity:${lead.id}:${emailMatch[0]}`
-            : `ask_email:opportunity:${lead.id}`;
-          opts.reply_markup = {
-            inline_keyboard: [[
-              { text: "📧 Draft Proposal Email", callback_data: cbData },
-            ]],
-          };
+          buttons.push({ text: "📧 Draft Email", callback_data: emailCb });
         }
+        opts.reply_markup = { inline_keyboard: [buttons] };
         await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram send", retries: 2 });
         await sleep(120);
       } catch (err) {
@@ -182,7 +183,9 @@ export async function deliverUnsentProspects(): Promise<number> {
             ...HTML,
             disable_web_page_preview: false,
           };
-          const buttons: TelegramBot.InlineKeyboardButton[] = [];
+          const buttons: TelegramBot.InlineKeyboardButton[] = [
+            { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
+          ];
           if (emailEnabled) {
             const cbData = p.website
               ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
@@ -192,9 +195,7 @@ export async function deliverUnsentProspects(): Promise<number> {
           if (whatsappEnabled && p.phone) {
             buttons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
           }
-          if (buttons.length > 0) {
-            opts.reply_markup = { inline_keyboard: [buttons] };
-          }
+          opts.reply_markup = { inline_keyboard: [buttons] };
           await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram prospect send", retries: 2 });
           await sleep(120);
         } catch (err) {
@@ -390,7 +391,10 @@ I scan tenders, RFPs, funding rounds, and "looking for a developer" posts every 
 
 <b>Prospect scanner</b>
 /prospect [type] in [location] — scan one business type in a location
-/scan [location] — scan ALL business types in a location (full sweep)`;
+/scan [location] — scan ALL business types in a location (full sweep)
+
+<b>Outreach</b>
+Each lead card has: 📞 Call Script · 📧 Draft Email · 📱 WhatsApp`;
 
 function registerCommands(b: TelegramBot): void {
   b.onText(/^\/start\b/, async (msg) => {
@@ -534,17 +538,19 @@ function registerCommands(b: TelegramBot): void {
       for (const p of prospects) {
         const message = formatProspect(p, 1);
         const opts: TelegramBot.SendMessageOptions = { ...HTML };
-        const buttons: TelegramBot.InlineKeyboardButton[] = [];
+        const scanButtons: TelegramBot.InlineKeyboardButton[] = [
+          { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
+        ];
         if (emailEnabled) {
           const cbData = p.website
             ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
             : `ask_email:prospect:${p.placeId}`;
-          buttons.push({ text: "📧 Draft Email", callback_data: cbData });
+          scanButtons.push({ text: "📧 Draft Email", callback_data: cbData });
         }
         if (whatsappEnabled && p.phone) {
-          buttons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
+          scanButtons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
         }
-        if (buttons.length > 0) opts.reply_markup = { inline_keyboard: [buttons] };
+        opts.reply_markup = { inline_keyboard: [scanButtons] };
         await b.sendMessage(msg.chat.id, message, opts);
         await sleep(200);
       }
@@ -744,6 +750,52 @@ function registerCommands(b: TelegramBot): void {
         }
       } catch (err) {
         log.error({ err: (err as Error).message }, "WhatsApp send failed");
+      }
+    } else if (data.startsWith("call_script:")) {
+      const parts = data.replace("call_script:", "").split(":");
+      const refType = parts[0] as "prospect" | "opportunity";
+      const refId = parts.slice(1).join(":");
+      await b.answerCallbackQuery(query.id, { text: "Generating call script..." });
+      await b.sendMessage(chatId, `⏳ Generating cold call script...`, HTML);
+      try {
+        let script;
+        let businessName: string;
+        if (refType === "prospect") {
+          const pr = await pool.query(`SELECT * FROM prospects WHERE place_id=$1`, [refId]);
+          if (!pr.rows[0]) { await b.sendMessage(chatId, "❌ Prospect not found.", HTML); return; }
+          const p = pr.rows[0];
+          const prospect: Prospect = {
+            placeId: p.place_id, name: p.name, address: p.address, phone: p.phone,
+            website: p.website, mapsUrl: p.maps_url, businessType: p.business_type,
+            location: p.location, prospectType: p.prospect_type,
+            perfScore: p.perf_score, mobileScore: p.mobile_score, seoScore: p.seo_score,
+            pitchReason: p.pitch_reason,
+          };
+          script = await buildProspectCallScript(prospect);
+          businessName = p.name;
+        } else {
+          const or = await pool.query(`SELECT * FROM opportunities WHERE id=$1`, [refId]);
+          if (!or.rows[0]) { await b.sendMessage(chatId, "❌ Opportunity not found.", HTML); return; }
+          const o = or.rows[0];
+          const opp: OpportunityRecord = {
+            id: o.id, sourceName: o.source_name, sourceCategory: o.source_category,
+            url: o.url, rawTitle: o.raw_title, title: o.title, company: o.company,
+            location: o.location, industry: o.industry, budgetText: o.budget_text,
+            estimatedValueUsd: o.estimated_value_usd ? Number(o.estimated_value_usd) : null,
+            deadline: o.deadline, contactInfo: o.contact_info,
+            technologies: o.technologies ?? [], category: o.category,
+            summary: o.summary, recommendedAction: o.recommended_action,
+            opportunityScore: o.opportunity_score, label: o.label,
+            status: o.status, telegramSent: o.telegram_sent, createdAt: o.created_at,
+          };
+          script = await buildOpportunityCallScript(opp);
+          businessName = o.company ?? o.title ?? "Lead";
+        }
+        const formatted = formatCallScript(script, businessName);
+        await b.sendMessage(chatId, formatted, HTML);
+      } catch (err) {
+        log.error({ err: (err as Error).message }, "Call script generation failed");
+        await b.sendMessage(chatId, `❌ Failed to generate call script: ${esc((err as Error).message)}`, HTML);
       }
     } else if (data.startsWith("edit_subject:") || data.startsWith("edit_body:")) {
       const isBody = data.startsWith("edit_body:");
