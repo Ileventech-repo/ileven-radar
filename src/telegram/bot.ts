@@ -416,11 +416,17 @@ I scan tenders, RFPs, funding rounds, and "looking for a developer" posts every 
 /categories — list available categories
 
 <b>Prospect scanner</b>
-/prospect [type] in [location] — scan one business type in a location
-/scan [location] — scan ALL business types in a location (full sweep)
+/scan [location] — sweep all popular business types in any city
+/scan [anything] in [location] — scan any specific business type
 
-<b>Outreach</b>
-Each lead card has: 📞 Call Script · 📧 Draft Email · 📱 WhatsApp`;
+<b>Examples</b>
+/scan Lagos, Nigeria
+/scan barbershops in Atlanta
+/scan nail salons in London
+/scan churches in Accra
+
+<b>Outreach on every card</b>
+📞 Call Script · 🤖 AI Call · 📧 Cold Email · 📱 WhatsApp`;
 
 function registerCommands(b: TelegramBot): void {
   b.onText(/^\/start\b/, async (msg) => {
@@ -495,82 +501,88 @@ function registerCommands(b: TelegramBot): void {
     await sendList(msg.chat.id, `🔎 Results for "${keyword}"`, opps);
   });
 
+  // /prospect kept as alias for backwards compatibility
   b.onText(/^\/prospect\b\s*(.*)$/, async (msg, match) => {
     const input = (match?.[1] ?? "").trim();
     if (!input) {
-      await b.sendMessage(
-        msg.chat.id,
-        `Usage: <code>/prospect hotels in Lagos</code>\n<code>/prospect restaurants in London, UK</code>\n\nScans Google Places for businesses with no website or a bad website.`,
-        HTML
-      );
+      await b.sendMessage(msg.chat.id, `Use <code>/scan [anything] in [location]</code>\n\nExamples:\n<code>/scan hotels in Lagos</code>\n<code>/scan Atlanta, USA</code>`, HTML);
       return;
     }
-    // Parse "type in location" or just "type location"
-    const inMatch = input.match(/^(.+?)\s+in\s+(.+)$/i);
-    const businessType = inMatch ? inMatch[1].trim() : input.split(" ").slice(0, -1).join(" ") || input;
-    const location = inMatch ? inMatch[2].trim() : input.split(" ").slice(-1)[0] || "Nigeria";
-
-    await b.sendMessage(
-      msg.chat.id,
-      `🔍 Scanning <b>${esc(businessType)}</b> in <b>${esc(location)}</b>...\nThis takes 1-2 minutes.`,
-      HTML
-    );
-
-    try {
-      const prospects = await scanProspects(businessType, location);
-      if (prospects.length === 0) {
-        await b.sendMessage(msg.chat.id, `✅ Scan complete — no new prospects found in ${esc(location)}.`, HTML);
-        return;
-      }
-      const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
-      const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
-      const header = `✅ <b>Scan complete — ${esc(businessType)} in ${esc(location)}</b>\n${noSite} no-website · ${badSite} bad-website\n`;
-      const body = prospects.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
-      await b.sendMessage(msg.chat.id, `${header}\n${body}`, { ...HTML, disable_web_page_preview: false });
-    } catch (err) {
-      await b.sendMessage(msg.chat.id, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
-    }
+    // forward to scan handler by re-emitting the text as /scan
+    await handleScan(msg.chat.id, input);
   });
 
-  b.onText(/^\/scan\b\s*(.*)$/, async (msg, match) => {
-    const location = (match?.[1] ?? "").trim();
-    if (!location) {
+  async function handleScan(chatId: number, input: string): Promise<void> {
+    if (!input) {
       await b.sendMessage(
-        msg.chat.id,
-        `Usage: <code>/scan Lagos, Nigeria</code>\n<code>/scan London, UK</code>\n\nScans 14 business types in that location for businesses with no website or a bad website.`,
+        chatId,
+        `<b>Scan any place, anywhere</b>\n\n` +
+        `<code>/scan [location]</code> — sweep all popular business types\n` +
+        `<code>/scan [type] in [location]</code> — scan any specific type\n\n` +
+        `<b>Examples:</b>\n` +
+        `<code>/scan Atlanta, USA</code>\n` +
+        `<code>/scan barbershops in Lagos</code>\n` +
+        `<code>/scan nail salons in London</code>\n` +
+        `<code>/scan churches in Accra</code>\n` +
+        `<code>/scan supermarkets in Dubai</code>`,
         HTML
       );
       return;
     }
+
+    // Detect "type in location" vs bare location
+    const inMatch = input.match(/^(.+?)\s+in\s+(.+)$/i);
+
+    if (inMatch) {
+      // Specific type scan — any business type the user wants
+      const businessType = inMatch[1].trim();
+      const location = inMatch[2].trim();
+      await b.sendMessage(chatId, `🔍 Scanning <b>${esc(businessType)}</b> in <b>${esc(location)}</b>...`, HTML);
+      try {
+        const prospects = await scanProspects(businessType, location);
+        await deliverScanResults(chatId, prospects, `${businessType} in ${location}`);
+      } catch (err) {
+        await b.sendMessage(chatId, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
+      }
+    } else {
+      // Full location sweep — all predefined business types
+      const location = input.trim();
+      await b.sendMessage(chatId, `🌍 Scanning <b>all business types</b> in <b>${esc(location)}</b>...\nThis takes a few minutes. Results will arrive as they're found.`, HTML);
+      try {
+        const prospects = await scanLocation(location);
+        await deliverScanResults(chatId, prospects, location);
+      } catch (err) {
+        await b.sendMessage(chatId, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
+      }
+    }
+  }
+
+  async function deliverScanResults(chatId: number, prospects: Prospect[], label: string): Promise<void> {
+    if (prospects.length === 0) {
+      await b.sendMessage(chatId, `✅ Scan complete — no new places found for <b>${esc(label)}</b>.`, HTML);
+      return;
+    }
+    const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
+    const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
+    const hasSite = prospects.filter((p) => p.prospectType === "found").length;
     await b.sendMessage(
-      msg.chat.id,
-      `🌍 Scanning <b>all business types</b> in <b>${esc(location)}</b>...\nThis may take 5-10 minutes. I'll message you when done.`,
+      chatId,
+      `✅ <b>${esc(label)}</b> — ${prospects.length} results\n🚫 ${noSite} no-website · ⚠️ ${badSite} bad-website · ✅ ${hasSite} has-website`,
       HTML
     );
-    try {
-      const prospects = await scanLocation(location);
-      const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
-      const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
-      if (prospects.length === 0) {
-        await b.sendMessage(msg.chat.id, `✅ Scan of <b>${esc(location)}</b> complete — no new prospects found.`, HTML);
-        return;
-      }
-      await b.sendMessage(
-        msg.chat.id,
-        `✅ <b>Location scan complete — ${esc(location)}</b>\n\n🚫 No-website: <b>${noSite}</b>\n⚠️ Bad-website: <b>${badSite}</b>\nTotal: <b>${prospects.length}</b>\n\nProspects are being sent to you now...`,
-        HTML
-      );
-      // Deliver immediately to this chat
-      for (const p of prospects) {
-        const message = formatProspect(p, 1);
-        const opts: TelegramBot.SendMessageOptions = { ...HTML };
-        opts.reply_markup = { inline_keyboard: buildProspectButtons(p) };
-        await b.sendMessage(msg.chat.id, message, opts);
-        await sleep(200);
-      }
-    } catch (err) {
-      await b.sendMessage(msg.chat.id, `❌ Scan failed: ${esc((err as Error).message)}`, HTML);
+    for (const p of prospects) {
+      try {
+        await b.sendMessage(chatId, formatProspect(p, 1), {
+          ...HTML,
+          reply_markup: { inline_keyboard: buildProspectButtons(p) },
+        });
+        await sleep(150);
+      } catch { /* skip individual failures */ }
     }
+  }
+
+  b.onText(/^\/scan\b\s*(.*)$/, async (msg, match) => {
+    await handleScan(msg.chat.id, (match?.[1] ?? "").trim());
   });
 
   b.onText(/^\/setchannel\b\s*(.*)$/, async (msg, match) => {
@@ -894,6 +906,21 @@ function registerCommands(b: TelegramBot): void {
   });
 
   // AI intent classifier for free-form messages
+  async function handleFreeTextScan(chatId: number, input: string): Promise<void> {
+    const inMatch = input.match(/^(.+?)\s+in\s+(.+)$/i);
+    if (inMatch) {
+      const businessType = inMatch[1].trim();
+      const location = inMatch[2].trim();
+      await b.sendMessage(chatId, `🔍 Scanning <b>${esc(businessType)}</b> in <b>${esc(location)}</b>...`, HTML);
+      const prospects = await scanProspects(businessType, location);
+      await deliverScanResults(chatId, prospects, `${businessType} in ${location}`);
+    } else {
+      await b.sendMessage(chatId, `🌍 Scanning all business types in <b>${esc(input)}</b>...\nResults will arrive as they're found.`, HTML);
+      const prospects = await scanLocation(input);
+      await deliverScanResults(chatId, prospects, input);
+    }
+  }
+
   async function handleFreeText(chatId: number, text: string): Promise<void> {
     let parsed: { intent: string; params: Record<string, string> } = { intent: "unknown", params: {} };
     try {
@@ -965,29 +992,11 @@ Return ONLY valid JSON: {"intent":"...","params":{}}`,
         `🆕 New (last 24h): <b>${stats.today}</b>`,
         `Agent is running and scanning every hour.`,
       ].join("\n"), HTML);
-    } else if (intent === "scan" && params.location) {
-      await b.sendMessage(chatId, `🌍 Scanning all business types in <b>${esc(params.location)}</b>...\nThis may take 5-10 minutes.`, HTML);
-      const prospects = await scanLocation(params.location);
-      const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
-      const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
-      if (prospects.length === 0) {
-        await b.sendMessage(chatId, `✅ Scan complete — no new prospects found in ${esc(params.location)}.`, HTML);
-      } else {
-        await b.sendMessage(chatId, `✅ <b>${esc(params.location)} scan done</b>\n🚫 ${noSite} no-website · ⚠️ ${badSite} bad-website`, HTML);
-        for (const p of prospects) {
-          await b.sendMessage(chatId, formatProspect(p, 1), { ...HTML, reply_markup: { inline_keyboard: buildProspectButtons(p) } });
-          await sleep(200);
-        }
-      }
-    } else if (intent === "prospect" && params.businessType && params.location) {
-      await b.sendMessage(chatId, `🔍 Scanning <b>${esc(params.businessType)}</b> in <b>${esc(params.location)}</b>...`, HTML);
-      const prospects = await scanProspects(params.businessType, params.location);
-      if (prospects.length === 0) {
-        await b.sendMessage(chatId, `✅ No new prospects found.`, HTML);
-      } else {
-        const body = prospects.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
-        await b.sendMessage(chatId, `✅ <b>${prospects.length} prospects found</b>\n\n${body}`, { ...HTML });
-      }
+    } else if ((intent === "scan" || intent === "prospect") && params.location) {
+      const scanInput = params.businessType
+        ? `${params.businessType} in ${params.location}`
+        : params.location;
+      await handleFreeTextScan(chatId, scanInput);
     } else if (intent === "help") {
       await b.sendMessage(chatId, HELP_TEXT, HTML);
     } else {
