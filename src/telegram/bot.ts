@@ -31,6 +31,7 @@ import {
 } from "../agents/placesProspectorAgent";
 import { draftProspectEmail, draftOpportunityEmail } from "../agents/emailDraftAgent";
 import { buildProspectCallScript, buildOpportunityCallScript, formatCallScript } from "../agents/callScriptAgent";
+import { openai } from "../services/openaiClient";
 import { sendEmail } from "../services/emailService";
 import { createFollowUpSequence } from "../services/sequenceService";
 import { draftAndSendWhatsApp } from "../services/whatsappService";
@@ -838,11 +839,136 @@ function registerCommands(b: TelegramBot): void {
     }
   });
 
+  // AI intent classifier for free-form messages
+  async function handleFreeText(chatId: number, text: string): Promise<void> {
+    let parsed: { intent: string; params: Record<string, string> } = { intent: "unknown", params: {} };
+    try {
+      const res = await openai.chat.completions.create({
+        model: env.OPENAI_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: `You are the command router for Ileven Radar, an AI business-opportunity discovery agent for a tech company.
+Classify the user message into one intent and extract parameters.
+
+Intents:
+- latest        → show latest opportunities
+- hot           → show hot leads (score 80+)
+- funding       → show startup funding
+- tenders       → show government tenders
+- websites      → show website projects
+- mobileapps    → show mobile app projects
+- search        → search by keyword (param: keyword)
+- status        → show agent stats
+- prospect      → scan one business type in a location (params: businessType, location)
+- scan          → scan ALL business types in a location (param: location)
+- help          → show help
+- unknown       → can't match any intent
+
+Return ONLY valid JSON: {"intent":"...","params":{}}`,
+          },
+          { role: "user", content: text },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 80,
+        temperature: 0,
+      });
+      parsed = JSON.parse(res.choices[0].message.content ?? "{}");
+    } catch {
+      // fall through to unknown
+    }
+
+    const { intent, params } = parsed;
+
+    if (intent === "latest") {
+      const opps = await queryOpportunities({ limit: 10 });
+      await sendList(chatId, "🆕 Latest opportunities", opps);
+    } else if (intent === "hot") {
+      const opps = await queryOpportunities({ label: "HOT", limit: 10 });
+      await sendList(chatId, "🔥 Hot leads", opps);
+    } else if (intent === "funding") {
+      const opps = await queryOpportunities({ category: "Startup Funding", limit: 10 });
+      await sendList(chatId, "💰 Startup funding", opps);
+    } else if (intent === "tenders") {
+      const opps = await queryOpportunities({ category: "Government Tender", limit: 10 });
+      await sendList(chatId, "🏛 Government tenders", opps);
+    } else if (intent === "websites") {
+      const opps = await queryOpportunities({ category: "Website Project", limit: 10 });
+      await sendList(chatId, "🌐 Website projects", opps);
+    } else if (intent === "mobileapps") {
+      const opps = await queryOpportunities({ category: "Mobile App Project", limit: 10 });
+      await sendList(chatId, "📱 Mobile app projects", opps);
+    } else if (intent === "search" && params.keyword) {
+      const opps = await queryOpportunities({ search: params.keyword, limit: 10 });
+      await sendList(chatId, `🔎 Results for "${params.keyword}"`, opps);
+    } else if (intent === "status") {
+      const stats = await getStats();
+      await b.sendMessage(chatId, [
+        `<b>📡 Ileven Radar status</b>`,
+        `Total opportunities: <b>${stats.total}</b>`,
+        `🔥 Hot leads: <b>${stats.hot}</b>`,
+        `🌤 Warm leads: <b>${stats.warm}</b>`,
+        `🆕 New (last 24h): <b>${stats.today}</b>`,
+        `Agent is running and scanning every hour.`,
+      ].join("\n"), HTML);
+    } else if (intent === "scan" && params.location) {
+      await b.sendMessage(chatId, `🌍 Scanning all business types in <b>${esc(params.location)}</b>...\nThis may take 5-10 minutes.`, HTML);
+      const prospects = await scanLocation(params.location);
+      const noSite = prospects.filter((p) => p.prospectType === "no_website").length;
+      const badSite = prospects.filter((p) => p.prospectType === "bad_website").length;
+      if (prospects.length === 0) {
+        await b.sendMessage(chatId, `✅ Scan complete — no new prospects found in ${esc(params.location)}.`, HTML);
+      } else {
+        await b.sendMessage(chatId, `✅ <b>${esc(params.location)} scan done</b>\n🚫 ${noSite} no-website · ⚠️ ${badSite} bad-website`, HTML);
+        for (const p of prospects) {
+          const scanBtns: TelegramBot.InlineKeyboardButton[] = [
+            { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
+          ];
+          if (emailEnabled) {
+            const cbData = p.website
+              ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
+              : `ask_email:prospect:${p.placeId}`;
+            scanBtns.push({ text: "📧 Draft Email", callback_data: cbData });
+          }
+          if (whatsappEnabled && p.phone) {
+            scanBtns.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
+          }
+          await b.sendMessage(chatId, formatProspect(p, 1), { ...HTML, reply_markup: { inline_keyboard: [scanBtns] } });
+          await sleep(200);
+        }
+      }
+    } else if (intent === "prospect" && params.businessType && params.location) {
+      await b.sendMessage(chatId, `🔍 Scanning <b>${esc(params.businessType)}</b> in <b>${esc(params.location)}</b>...`, HTML);
+      const prospects = await scanProspects(params.businessType, params.location);
+      if (prospects.length === 0) {
+        await b.sendMessage(chatId, `✅ No new prospects found.`, HTML);
+      } else {
+        const body = prospects.map((p, i) => formatProspect(p, i + 1)).join("\n\n");
+        await b.sendMessage(chatId, `✅ <b>${prospects.length} prospects found</b>\n\n${body}`, { ...HTML });
+      }
+    } else if (intent === "help") {
+      await b.sendMessage(chatId, HELP_TEXT, HTML);
+    } else {
+      await b.sendMessage(
+        chatId,
+        `🤖 I didn't quite get that. Here's what I can do:\n\n${HELP_TEXT}`,
+        HTML
+      );
+    }
+  }
+
   // Catch replies to force_reply prompts (edits + email address entry)
+  // Also handles free-form text via AI intent classifier
   b.on("message", async (msg) => {
-    if (!msg.reply_to_message || !msg.text) return;
-    const repliedMsgId = msg.reply_to_message.message_id;
+    if (!msg.text) return;
     const chatId = msg.chat.id;
+
+    // Skip commands — already handled by onText handlers
+    if (msg.text.startsWith("/")) return;
+
+    // ---- Force-reply handling ----
+    if (msg.reply_to_message) {
+    const repliedMsgId = msg.reply_to_message.message_id;
 
     // ---- Handle edit body / edit subject replies ----
     const editKey = `${chatId}:${repliedMsgId}`;
@@ -891,9 +1017,19 @@ function registerCommands(b: TelegramBot): void {
       return;
     }
 
-    await pool.query(`UPDATE email_outreach SET to_email = $1 WHERE id = $2`, [emailInput, id]);
-    await pool.query(`DELETE FROM email_outreach WHERE id = $1`, [id]);
-    await sendEmailApprovalRequest(chatId, ref_type as "prospect" | "opportunity", ref_id, emailInput, emailInput);
+      await pool.query(`UPDATE email_outreach SET to_email = $1 WHERE id = $2`, [emailInput, id]);
+      await pool.query(`DELETE FROM email_outreach WHERE id = $1`, [id]);
+      await sendEmailApprovalRequest(chatId, ref_type as "prospect" | "opportunity", ref_id, emailInput, emailInput);
+      return;
+    } // end force-reply block
+
+    // ---- Free-form text: AI intent router ----
+    try {
+      await handleFreeText(chatId, msg.text);
+    } catch (err) {
+      log.error({ err: (err as Error).message }, "Free-text handler failed");
+      await b.sendMessage(chatId, `❌ Something went wrong. Try /help to see available commands.`, HTML);
+    }
   });
 
   b.on("polling_error", (err) => {
