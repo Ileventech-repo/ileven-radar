@@ -184,6 +184,50 @@ export function createApiServer() {
     res.status(202).json({ status: "started" });
   });
 
+  // ---- Debug: full scan trace for one business type ----
+  app.get("/api/debug/scan", async (req, res, next) => {
+    try {
+      const businessType = String(req.query.type ?? "hotel");
+      const location = String(req.query.location ?? "Lagos, Nigeria");
+      const key = env.GOOGLE_PLACES_API_KEY;
+      if (!key) return res.status(400).json({ error: "GOOGLE_PLACES_API_KEY not set" });
+
+      // Step 1: search
+      const searchResp = await axios.get("https://maps.googleapis.com/maps/api/place/textsearch/json", {
+        params: { query: `${businessType} in ${location}`, key },
+        timeout: 15_000,
+      });
+      const places = (searchResp.data?.results ?? []) as Array<{ place_id: string; name: string }>;
+
+      // Step 2: get details for first 3
+      const details = [];
+      for (const p of places.slice(0, 3)) {
+        try {
+          const dr = await axios.get("https://maps.googleapis.com/maps/api/place/details/json", {
+            params: { place_id: p.place_id, fields: "place_id,name,formatted_address,formatted_phone_number,website,url", key },
+            timeout: 10_000,
+          });
+          details.push({ placeId: p.place_id, name: p.name, result: dr.data?.result, status: dr.data?.status });
+        } catch (err) {
+          details.push({ placeId: p.place_id, name: p.name, error: (err as Error).message });
+        }
+      }
+
+      // Step 3: check DB for known place_ids
+      const knownCheck = await pool.query(
+        "SELECT place_id FROM prospects WHERE place_id = ANY($1)",
+        [places.slice(0, 10).map((p) => p.place_id)]
+      );
+
+      res.json({
+        searchStatus: searchResp.data?.status,
+        totalFound: places.length,
+        alreadyInDb: knownCheck.rows.length,
+        sampleDetails: details,
+      });
+    } catch (err) { next(err); }
+  });
+
   // ---- Debug: test Places API key directly ----
   app.get("/api/debug/places", async (req, res, next) => {
     try {

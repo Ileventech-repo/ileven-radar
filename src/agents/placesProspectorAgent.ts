@@ -172,13 +172,17 @@ async function saveProspect(p: Prospect): Promise<void> {
 async function runConcurrent<T, R>(
   items: T[],
   fn: (item: T) => Promise<R>,
-  concurrency: number
+  concurrency: number,
+  delayBetweenBatchesMs = 0
 ): Promise<R[]> {
   const results: R[] = [];
   for (let i = 0; i < items.length; i += concurrency) {
     const batch = items.slice(i, i + concurrency);
     const batchResults = await Promise.all(batch.map(fn));
     results.push(...batchResults);
+    if (delayBetweenBatchesMs > 0 && i + concurrency < items.length) {
+      await sleep(delayBetweenBatchesMs);
+    }
   }
   return results;
 }
@@ -250,11 +254,17 @@ export async function scanProspects(
   log.info({ businessType, location }, "Scanning prospects");
   const places = await searchPlaces(businessType, location);
 
-  // Process 5 places concurrently — ~4x faster, same API cost
+  log.info({ businessType, location, total: places.length }, "Processing places");
+
+  // Process 3 places concurrently, 300ms between batches — respects Places API rate limits
   const settled = await runConcurrent(
     places,
-    (place) => processPlace(place, businessType, location).catch(() => null),
-    5
+    (place) => processPlace(place, businessType, location).catch((err) => {
+      log.error({ placeId: place.place_id, name: place.name, err: (err as Error).message }, "processPlace failed");
+      return null;
+    }),
+    3,
+    300
   );
 
   const results = settled.filter((p): p is Prospect => p !== null);
