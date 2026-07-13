@@ -42,6 +42,15 @@ let bot: TelegramBot | null = null;
 
 const HTML = { parse_mode: "HTML" as const, disable_web_page_preview: true };
 
+// Tracks pending edit sessions: key = "chatId:promptMsgId" → { draftId, action }
+const pendingEdits = new Map<string, { draftId: string; action: "subject" | "body" }>();
+
+function plainToHtml(text: string): string {
+  const escaped = text
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<div style="font-family:Arial,sans-serif;font-size:15px;color:#222">${escaped.replace(/\n\n+/g, "</p><p>").replace(/\n/g, "<br>")}</div>`;
+}
+
 export function getBot(): TelegramBot {
   if (!bot) {
     throw new Error("Telegram bot not initialized - call startTelegramBot() first");
@@ -224,6 +233,51 @@ async function createEmailDraftRecord(
   return result.rows[0].id;
 }
 
+async function showEmailPreview(
+  b: TelegramBot,
+  chatId: number,
+  draftId: string,
+  toEmail: string,
+  subject: string,
+  plainText: string
+): Promise<void> {
+  const MAX_BODY = 3200;
+  const body = plainText.length > MAX_BODY
+    ? plainText.slice(0, MAX_BODY) + "\n\n<i>... (email continues — tap Edit Body to see/change full text)</i>"
+    : plainText;
+
+  const preview = [
+    `📧 <b>Email Draft</b>`,
+    ``,
+    `<b>To:</b> ${esc(toEmail)}`,
+    `<b>Subject:</b> ${esc(subject)}`,
+    ``,
+    esc(body),
+  ].join("\n");
+
+  const sent = await b.sendMessage(chatId, preview, {
+    ...HTML,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ Send Email", callback_data: `email_send:${draftId}` },
+          { text: "📎 Send with PDF", callback_data: `email_send_pdf:${draftId}` },
+        ],
+        [
+          { text: "✏️ Edit Subject", callback_data: `edit_subject:${draftId}` },
+          { text: "✏️ Edit Body", callback_data: `edit_body:${draftId}` },
+        ],
+        [
+          { text: "❌ Cancel", callback_data: `email_cancel:${draftId}` },
+        ],
+      ],
+    },
+  });
+
+  // Save preview message_id so we know which message to reference for edits
+  await pool.query(`UPDATE email_outreach SET telegram_msg_id = $1 WHERE id = $2`, [sent.message_id, draftId]);
+}
+
 export async function sendEmailApprovalRequest(
   chatId: number,
   refType: "prospect" | "opportunity",
@@ -275,22 +329,7 @@ export async function sendEmailApprovalRequest(
       refType, refId, toEmail, draft.subject, draft.html, draft.plainText, chatId
     );
 
-    const preview = `📧 <b>Email Draft</b>\n\n<b>To:</b> ${esc(toEmail)}\n<b>Subject:</b> ${esc(draft.subject)}\n\n${esc(draft.plainText.slice(0, 600))}${draft.plainText.length > 600 ? "..." : ""}`;
-
-    await bot.sendMessage(chatId, preview, {
-      ...HTML,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "✅ Send Email", callback_data: `email_send:${draftId}` },
-            { text: "📎 Send with PDF", callback_data: `email_send_pdf:${draftId}` },
-          ],
-          [
-            { text: "❌ Cancel", callback_data: `email_cancel:${draftId}` },
-          ],
-        ],
-      },
-    });
+    await showEmailPreview(bot, chatId, draftId, toEmail, draft.subject, draft.plainText);
   } catch (err) {
     await bot.sendMessage(chatId, `❌ Failed to draft email: ${esc((err as Error).message)}`, HTML);
   }
@@ -706,6 +745,19 @@ function registerCommands(b: TelegramBot): void {
       } catch (err) {
         log.error({ err: (err as Error).message }, "WhatsApp send failed");
       }
+    } else if (data.startsWith("edit_subject:") || data.startsWith("edit_body:")) {
+      const isBody = data.startsWith("edit_body:");
+      const draftId = data.replace(isBody ? "edit_body:" : "edit_subject:", "");
+      await b.answerCallbackQuery(query.id, { text: isBody ? "Paste new body below" : "Enter new subject below" });
+      const action = isBody ? "body" : "subject";
+      const prompt = isBody
+        ? `✏️ <b>Edit Email Body</b>\n\nReply with your full updated email body (plain text). It will replace the current body.`
+        : `✏️ <b>Edit Subject Line</b>\n\nReply with the new subject line:`;
+      const promptMsg = await b.sendMessage(chatId, prompt, {
+        ...HTML,
+        reply_markup: { force_reply: true, selective: true },
+      });
+      pendingEdits.set(`${chatId}:${promptMsg.message_id}`, { draftId, action });
     } else if (data.startsWith("draft_email:")) {
       const parts = data.replace("draft_email:", "").split(":");
       const refType = parts[0] as "prospect" | "opportunity";
@@ -734,13 +786,45 @@ function registerCommands(b: TelegramBot): void {
     }
   });
 
-  // Catch replies to force_reply email prompts
+  // Catch replies to force_reply prompts (edits + email address entry)
   b.on("message", async (msg) => {
     if (!msg.reply_to_message || !msg.text) return;
     const repliedMsgId = msg.reply_to_message.message_id;
     const chatId = msg.chat.id;
 
-    // Look up pending email outreach waiting for this reply
+    // ---- Handle edit body / edit subject replies ----
+    const editKey = `${chatId}:${repliedMsgId}`;
+    const pendingEdit = pendingEdits.get(editKey);
+    if (pendingEdit) {
+      pendingEdits.delete(editKey);
+      const { draftId, action } = pendingEdit;
+      const newValue = msg.text.trim();
+
+      try {
+        if (action === "subject") {
+          await pool.query(`UPDATE email_outreach SET subject = $1 WHERE id = $2`, [newValue, draftId]);
+        } else {
+          const newHtml = plainToHtml(newValue);
+          await pool.query(`UPDATE email_outreach SET plain_body = $1, html_body = $2 WHERE id = $3`, [newValue, newHtml, draftId]);
+        }
+
+        // Fetch the updated draft and show the full preview again
+        const dr = await pool.query<{ to_email: string; subject: string; plain_body: string }>(
+          `SELECT to_email, subject, plain_body FROM email_outreach WHERE id = $1`,
+          [draftId]
+        );
+        if (dr.rows[0]) {
+          const { to_email, subject, plain_body } = dr.rows[0];
+          await b.sendMessage(chatId, `✅ ${action === "subject" ? "Subject" : "Body"} updated.`, HTML);
+          await showEmailPreview(b, chatId, draftId, to_email, subject, plain_body);
+        }
+      } catch (err) {
+        await b.sendMessage(chatId, `❌ Failed to update ${action}: ${esc((err as Error).message)}`, HTML);
+      }
+      return;
+    }
+
+    // ---- Handle email address entry (ask_email flow) ----
     const result = await pool.query<{ id: string; ref_type: string; ref_id: string }>(
       `SELECT id, ref_type, ref_id FROM email_outreach
        WHERE status = 'pending' AND to_email = '' AND telegram_chat_id = $1 AND telegram_msg_id = $2`,
@@ -755,11 +839,8 @@ function registerCommands(b: TelegramBot): void {
       return;
     }
 
-    // Update the record with the provided email
     await pool.query(`UPDATE email_outreach SET to_email = $1 WHERE id = $2`, [emailInput, id]);
-    // Delete the placeholder so it doesn't interfere with normal flow
     await pool.query(`DELETE FROM email_outreach WHERE id = $1`, [id]);
-
     await sendEmailApprovalRequest(chatId, ref_type as "prospect" | "opportunity", ref_id, emailInput, emailInput);
   });
 
@@ -786,7 +867,8 @@ export async function startTelegramBot(): Promise<void> {
     { command: "setchannel", description: "Route a category to this chat" },
     { command: "channels", description: "List active channel routes" },
     { command: "categories", description: "List available categories" },
-    { command: "prospect", description: "Scan businesses with no/bad website" },
+    { command: "prospect", description: "Scan one business type in a location" },
+    { command: "scan", description: "Scan ALL business types in a location" },
   ]);
 
   log.info("Telegram bot started (long polling)");
