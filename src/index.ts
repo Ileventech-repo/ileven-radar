@@ -4,6 +4,8 @@ import { pool } from "./db/pool";
 import { createApiServer } from "./api/server";
 import { startTelegramBot, stopTelegramBot } from "./telegram/bot";
 import { startScheduler } from "./scheduler/cron";
+import { attachCallMediaStream } from "./api/webhooks/twilioVoice";
+import { callAgentEnabled } from "./config/env";
 
 async function main() {
   logger.info("🛰  Ileven Radar starting up");
@@ -12,7 +14,14 @@ async function main() {
   await runMigrations();
 
   // 2. HTTP API + healthcheck (Railway needs a listening port).
-  const server = createApiServer().listen();
+  const { app, listen } = createApiServer();
+  const server = listen();
+
+  // 2b. WebSocket server for Twilio call media stream
+  if (callAgentEnabled) {
+    attachCallMediaStream(server);
+    logger.info("Call agent WebSocket ready");
+  }
 
   // 3. Telegram bot (commands + push notifications).
   await startTelegramBot();

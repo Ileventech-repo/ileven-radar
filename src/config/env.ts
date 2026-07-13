@@ -34,10 +34,12 @@ const envSchema = z.object({
   // Contact finder
   HUNTER_API_KEY: z.string().optional().default(""),
 
-  // WhatsApp (Twilio)
+  // WhatsApp + Voice (Twilio)
   TWILIO_ACCOUNT_SID: z.string().optional().default(""),
   TWILIO_AUTH_TOKEN: z.string().optional().default(""),
   TWILIO_WHATSAPP_NUMBER: z.string().optional().default(""), // e.g. whatsapp:+14155238886
+  TWILIO_PHONE_NUMBER: z.string().optional().default(""),   // e.g. +14155551234 (voice calls)
+  PUBLIC_URL: z.string().optional().default(""),            // e.g. https://ileven-radar-production.up.railway.app
 
   TELEGRAM_BOT_TOKEN: z.string().min(1, "TELEGRAM_BOT_TOKEN is required"),
 
@@ -69,3 +71,4 @@ export const placesEnabled = Boolean(env.GOOGLE_PLACES_API_KEY);
 export const emailEnabled = Boolean(env.RESEND_API_KEY);
 export const hunterEnabled = Boolean(env.HUNTER_API_KEY);
 export const whatsappEnabled = Boolean(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_WHATSAPP_NUMBER);
+export const callAgentEnabled = Boolean(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER && env.PUBLIC_URL);

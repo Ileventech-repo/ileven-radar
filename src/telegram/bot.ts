@@ -1,5 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
-import { env, emailEnabled, whatsappEnabled } from "../config/env";
+import { env, emailEnabled, whatsappEnabled, callAgentEnabled } from "../config/env";
 import { childLogger } from "../config/logger";
 import { withRetry, sleep } from "../utils/retry";
 import {
@@ -31,6 +31,7 @@ import {
 } from "../agents/placesProspectorAgent";
 import { draftProspectEmail, draftOpportunityEmail } from "../agents/emailDraftAgent";
 import { buildProspectCallScript, buildOpportunityCallScript, formatCallScript } from "../agents/callScriptAgent";
+import { buildCallSystemPrompt, initiateCall } from "../services/callAgentService";
 import { openai } from "../services/openaiClient";
 import { sendEmail } from "../services/emailService";
 import { createFollowUpSequence } from "../services/sequenceService";
@@ -184,19 +185,23 @@ export async function deliverUnsentProspects(): Promise<number> {
             ...HTML,
             disable_web_page_preview: false,
           };
-          const buttons: TelegramBot.InlineKeyboardButton[] = [
+          const row1: TelegramBot.InlineKeyboardButton[] = [
             { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
           ];
+          if (callAgentEnabled && p.phone) {
+            row1.push({ text: "🤖 AI Call", callback_data: `make_call:prospect:${p.placeId}` });
+          }
+          const row2: TelegramBot.InlineKeyboardButton[] = [];
           if (emailEnabled) {
             const cbData = p.website
               ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
               : `ask_email:prospect:${p.placeId}`;
-            buttons.push({ text: "📧 Draft Email", callback_data: cbData });
+            row2.push({ text: "📧 Draft Email", callback_data: cbData });
           }
           if (whatsappEnabled && p.phone) {
-            buttons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
+            row2.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
           }
-          opts.reply_markup = { inline_keyboard: [buttons] };
+          opts.reply_markup = { inline_keyboard: row2.length > 0 ? [row1, row2] : [row1] };
           await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram prospect send", retries: 2 });
           await sleep(120);
         } catch (err) {
@@ -751,6 +756,47 @@ function registerCommands(b: TelegramBot): void {
         }
       } catch (err) {
         log.error({ err: (err as Error).message }, "WhatsApp send failed");
+      }
+    } else if (data.startsWith("make_call:")) {
+      const parts = data.replace("make_call:", "").split(":");
+      const refType = parts[0] as "prospect" | "opportunity";
+      const refId = parts.slice(1).join(":");
+      await b.answerCallbackQuery(query.id, { text: "Initiating AI call..." });
+
+      try {
+        let toPhone: string | undefined;
+        let prospectName: string;
+        let pitchContext: string;
+
+        if (refType === "prospect") {
+          const pr = await pool.query(`SELECT * FROM prospects WHERE place_id=$1`, [refId]);
+          if (!pr.rows[0]) { await b.sendMessage(chatId, "❌ Prospect not found.", HTML); return; }
+          const p = pr.rows[0];
+          toPhone = p.phone;
+          prospectName = p.name;
+          pitchContext = `${p.name} is a ${p.business_type} in ${p.address}. ${p.pitch_reason}`;
+        } else {
+          await b.sendMessage(chatId, "❌ AI calls currently supported for prospects only.", HTML);
+          return;
+        }
+
+        if (!toPhone) {
+          await b.sendMessage(chatId, `❌ No phone number found for this prospect. Try WhatsApp or Email instead.`, HTML);
+          return;
+        }
+
+        const systemPrompt = buildCallSystemPrompt(prospectName, pitchContext);
+        await b.sendMessage(
+          chatId,
+          `📞 <b>Calling ${esc(prospectName)}</b>\n${esc(toPhone)}\n\n<i>The AI agent will introduce ${esc(env.COMPANY_NAME)}, pitch the service, and try to book a follow-up. You'll receive the transcript when the call ends.</i>`,
+          HTML
+        );
+
+        const callSid = await initiateCall(toPhone, prospectName, systemPrompt, chatId);
+        log.info({ callSid, prospectName, toPhone }, "AI call initiated from Telegram");
+      } catch (err) {
+        log.error({ err: (err as Error).message }, "AI call initiation failed");
+        await b.sendMessage(chatId, `❌ Failed to start call: ${esc((err as Error).message)}`, HTML);
       }
     } else if (data.startsWith("call_script:")) {
       const parts = data.replace("call_script:", "").split(":");

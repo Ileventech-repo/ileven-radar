@@ -16,6 +16,7 @@ import {
 import { runPipeline } from "../scheduler/pipeline";
 import { runProspectCycle } from "../scheduler/prospectPipeline";
 import { scanProspects, scanLocation } from "../agents/placesProspectorAgent";
+import { createVoiceWebhookRouter } from "./webhooks/twilioVoice";
 import axios from "axios";
 
 const log = childLogger("Api");
@@ -117,6 +118,9 @@ export function createApiServer() {
       next(err);
     }
   });
+
+  // ---- Twilio voice webhooks ----
+  app.use("/webhooks/twilio/voice", createVoiceWebhookRouter());
 
   // ---- Manual pipeline trigger ----
   app.post("/api/run", async (_req, res) => {
