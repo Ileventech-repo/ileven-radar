@@ -168,6 +168,76 @@ async function saveProspect(p: Prospect): Promise<void> {
   );
 }
 
+// Run at most `concurrency` async tasks at a time
+async function runConcurrent<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  concurrency: number
+): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map(fn));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+async function processPlace(
+  place: PlaceSearchResult,
+  businessType: string,
+  location: string
+): Promise<Prospect | null> {
+  if (await isAlreadyKnown(place.place_id)) return null;
+
+  const details = await getPlaceDetails(place.place_id);
+  if (!details) return null;
+
+  if (!details.website) {
+    const p: Prospect = {
+      placeId: details.place_id,
+      name: details.name,
+      address: details.formatted_address,
+      phone: details.formatted_phone_number,
+      mapsUrl: details.url,
+      businessType,
+      location,
+      prospectType: "no_website",
+      pitchReason: "",
+    };
+    p.pitchReason = buildPitchReason(p);
+    await saveProspect(p);
+    return p;
+  }
+
+  // Has website — check PageSpeed in parallel with other places
+  const scores = await getPageSpeedScores(details.website);
+  const isBad = scores && (
+    scores.performance < BAD_SITE_THRESHOLD ||
+    scores.mobile < BAD_SITE_THRESHOLD ||
+    scores.seo < BAD_SITE_THRESHOLD
+  );
+
+  const p: Prospect = {
+    placeId: details.place_id,
+    name: details.name,
+    address: details.formatted_address,
+    phone: details.formatted_phone_number,
+    website: details.website,
+    mapsUrl: details.url,
+    businessType,
+    location,
+    prospectType: isBad ? "bad_website" : "found",
+    perfScore: scores?.performance,
+    mobileScore: scores?.mobile,
+    seoScore: scores?.seo,
+    pitchReason: "",
+  };
+  p.pitchReason = buildPitchReason(p);
+  await saveProspect(p);
+  return p;
+}
+
 export async function scanProspects(
   businessType: string,
   location: string
@@ -179,61 +249,15 @@ export async function scanProspects(
 
   log.info({ businessType, location }, "Scanning prospects");
   const places = await searchPlaces(businessType, location);
-  const results: Prospect[] = [];
 
-  for (const place of places) {
-    if (await isAlreadyKnown(place.place_id)) continue;
+  // Process 5 places concurrently — ~4x faster, same API cost
+  const settled = await runConcurrent(
+    places,
+    (place) => processPlace(place, businessType, location).catch(() => null),
+    5
+  );
 
-    await sleep(200); // gentle rate limiting
-    const details = await getPlaceDetails(place.place_id);
-    if (!details) continue;
-
-    if (!details.website) {
-      const p: Prospect = {
-        placeId: details.place_id,
-        name: details.name,
-        address: details.formatted_address,
-        phone: details.formatted_phone_number,
-        mapsUrl: details.url,
-        businessType,
-        location,
-        prospectType: "no_website",
-        pitchReason: "",
-      };
-      p.pitchReason = buildPitchReason(p);
-      await saveProspect(p);
-      results.push(p);
-    } else {
-      // Has website — check quality
-      await sleep(500);
-      const scores = await getPageSpeedScores(details.website);
-
-      const isBad = scores && (
-        scores.performance < BAD_SITE_THRESHOLD ||
-        scores.mobile < BAD_SITE_THRESHOLD ||
-        scores.seo < BAD_SITE_THRESHOLD
-      );
-
-      const p: Prospect = {
-        placeId: details.place_id,
-        name: details.name,
-        address: details.formatted_address,
-        phone: details.formatted_phone_number,
-        website: details.website,
-        mapsUrl: details.url,
-        businessType,
-        location,
-        prospectType: isBad ? "bad_website" : "found",
-        perfScore: scores?.performance,
-        mobileScore: scores?.mobile,
-        seoScore: scores?.seo,
-        pitchReason: "",
-      };
-      p.pitchReason = buildPitchReason(p);
-      await saveProspect(p);
-      results.push(p);
-    }
-  }
+  const results = settled.filter((p): p is Prospect => p !== null);
 
   await pool.query(
     `UPDATE prospect_targets SET last_run_at = now() WHERE business_type = $1 AND location = $2`,
@@ -251,17 +275,20 @@ export const SCAN_BUSINESS_TYPES = [
 ];
 
 export async function scanLocation(location: string, businessTypes = SCAN_BUSINESS_TYPES): Promise<Prospect[]> {
-  const all: Prospect[] = [];
-  for (const type of businessTypes) {
-    try {
-      const found = await scanProspects(type, location);
-      all.push(...found);
-      await sleep(500);
-    } catch (err) {
-      log.error({ err: (err as Error).message, type, location }, "scanLocation: type scan failed");
-    }
-  }
-  return all;
+  // Run 3 business types concurrently — each type is already parallelised internally
+  const batches = await runConcurrent(
+    businessTypes,
+    async (type) => {
+      try {
+        return await scanProspects(type, location);
+      } catch (err) {
+        log.error({ err: (err as Error).message, type, location }, "scanLocation: type scan failed");
+        return [];
+      }
+    },
+    3
+  );
+  return batches.flat();
 }
 
 export async function runAllProspectTargets(): Promise<number> {
