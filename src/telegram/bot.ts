@@ -139,7 +139,10 @@ export async function deliverQualifiedLeads(): Promise<number> {
 }
 
 function formatProspect(p: Prospect, index: number): string {
-  const typeLabel = p.prospectType === "no_website" ? "🚫 NO WEBSITE" : "⚠️ BAD WEBSITE";
+  const typeLabel =
+    p.prospectType === "no_website" ? "🚫 NO WEBSITE" :
+    p.prospectType === "bad_website" ? "⚠️ BAD WEBSITE" :
+    "✅ HAS WEBSITE";
   const lines = [
     `${index}. ${typeLabel}`,
     `<b>${esc(p.name)}</b>`,
@@ -202,7 +205,13 @@ export async function deliverUnsentProspects(): Promise<number> {
   for (const [groupKey, items] of groups) {
     const noSite = items.filter((p) => p.prospectType === "no_website").length;
     const badSite = items.filter((p) => p.prospectType === "bad_website").length;
-    const header = `🌍 <b>Prospects — ${esc(groupKey)}</b>\nFound: ${noSite} no-website · ${badSite} bad-website\n`;
+    const found = items.filter((p) => p.prospectType === "found").length;
+    const parts = [
+      noSite ? `${noSite} no-website` : "",
+      badSite ? `${badSite} bad-website` : "",
+      found ? `${found} has-website` : "",
+    ].filter(Boolean).join(" · ");
+    const header = `🌍 <b>Prospects — ${esc(groupKey)}</b>\nFound: ${parts}\n`;
 
     for (const p of items) {
       const message = `${header}\n${formatProspect(p, 1)}`;

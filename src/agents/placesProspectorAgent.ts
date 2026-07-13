@@ -10,6 +10,8 @@ const PLACES_BASE = "https://maps.googleapis.com/maps/api/place";
 const PAGESPEED_BASE = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 const BAD_SITE_THRESHOLD = env.PROSPECT_MIN_SCORE;
 
+export type ProspectType = "no_website" | "bad_website" | "found";
+
 export interface Prospect {
   placeId: string;
   name: string;
@@ -19,7 +21,7 @@ export interface Prospect {
   mapsUrl?: string;
   businessType: string;
   location: string;
-  prospectType: "no_website" | "bad_website";
+  prospectType: ProspectType;
   perfScore?: number;
   mobileScore?: number;
   seoScore?: number;
@@ -48,19 +50,38 @@ interface PageSpeedScores {
   seo: number;
 }
 
+const RESULTS_PER_SCAN = 25;
+
 async function searchPlaces(businessType: string, location: string): Promise<PlaceSearchResult[]> {
-  const response = await withRetry(
-    () =>
-      axios.get(`${PLACES_BASE}/textsearch/json`, {
-        params: {
-          query: `${businessType} in ${location}`,
-          key: env.GOOGLE_PLACES_API_KEY,
-        },
-        timeout: 15_000,
-      }),
+  const params: Record<string, string> = {
+    query: `${businessType} in ${location}`,
+    key: env.GOOGLE_PLACES_API_KEY,
+  };
+
+  const first = await withRetry(
+    () => axios.get(`${PLACES_BASE}/textsearch/json`, { params, timeout: 15_000 }),
     { label: `Places search: ${businessType} in ${location}`, retries: 2 }
   );
-  return (response.data?.results ?? []) as PlaceSearchResult[];
+
+  const results: PlaceSearchResult[] = first.data?.results ?? [];
+  const nextPageToken: string | undefined = first.data?.next_page_token;
+
+  // Google requires a short delay before the next_page_token is valid
+  if (results.length < RESULTS_PER_SCAN && nextPageToken) {
+    await sleep(2_000);
+    try {
+      const second = await withRetry(
+        () => axios.get(`${PLACES_BASE}/textsearch/json`, {
+          params: { key: env.GOOGLE_PLACES_API_KEY, pagetoken: nextPageToken },
+          timeout: 15_000,
+        }),
+        { label: `Places search page 2: ${businessType} in ${location}`, retries: 2 }
+      );
+      results.push(...(second.data?.results ?? []));
+    } catch { /* page 2 is optional */ }
+  }
+
+  return results.slice(0, RESULTS_PER_SCAN);
 }
 
 async function getPlaceDetails(placeId: string): Promise<PlaceDetailsResult | null> {
@@ -114,11 +135,14 @@ function buildPitchReason(prospect: Omit<Prospect, "pitchReason">): string {
   if (prospect.prospectType === "no_website") {
     return "No website found — opportunity to build their first online presence.";
   }
-  const issues: string[] = [];
-  if ((prospect.perfScore ?? 100) < BAD_SITE_THRESHOLD) issues.push(`slow (${prospect.perfScore}/100)`);
-  if ((prospect.mobileScore ?? 100) < BAD_SITE_THRESHOLD) issues.push(`not mobile-friendly (${prospect.mobileScore}/100)`);
-  if ((prospect.seoScore ?? 100) < BAD_SITE_THRESHOLD) issues.push(`poor SEO (${prospect.seoScore}/100)`);
-  return `Website needs work: ${issues.join(", ")}.`;
+  if (prospect.prospectType === "bad_website") {
+    const issues: string[] = [];
+    if ((prospect.perfScore ?? 100) < BAD_SITE_THRESHOLD) issues.push(`slow (${prospect.perfScore}/100)`);
+    if ((prospect.mobileScore ?? 100) < BAD_SITE_THRESHOLD) issues.push(`not mobile-friendly (${prospect.mobileScore}/100)`);
+    if ((prospect.seoScore ?? 100) < BAD_SITE_THRESHOLD) issues.push(`poor SEO (${prospect.seoScore}/100)`);
+    return `Website needs work: ${issues.join(", ")}.`;
+  }
+  return "Active business with online presence — general outreach opportunity.";
 }
 
 async function isAlreadyKnown(placeId: string): Promise<boolean> {
@@ -165,7 +189,6 @@ export async function scanProspects(
     if (!details) continue;
 
     if (!details.website) {
-      // No website — immediate prospect
       const p: Prospect = {
         placeId: details.place_id,
         name: details.name,
@@ -184,33 +207,31 @@ export async function scanProspects(
       // Has website — check quality
       await sleep(500);
       const scores = await getPageSpeedScores(details.website);
-      if (!scores) continue;
 
-      const isBad =
+      const isBad = scores && (
         scores.performance < BAD_SITE_THRESHOLD ||
         scores.mobile < BAD_SITE_THRESHOLD ||
-        scores.seo < BAD_SITE_THRESHOLD;
+        scores.seo < BAD_SITE_THRESHOLD
+      );
 
-      if (isBad) {
-        const p: Prospect = {
-          placeId: details.place_id,
-          name: details.name,
-          address: details.formatted_address,
-          phone: details.formatted_phone_number,
-          website: details.website,
-          mapsUrl: details.url,
-          businessType,
-          location,
-          prospectType: "bad_website",
-          perfScore: scores.performance,
-          mobileScore: scores.mobile,
-          seoScore: scores.seo,
-          pitchReason: "",
-        };
-        p.pitchReason = buildPitchReason(p);
-        await saveProspect(p);
-        results.push(p);
-      }
+      const p: Prospect = {
+        placeId: details.place_id,
+        name: details.name,
+        address: details.formatted_address,
+        phone: details.formatted_phone_number,
+        website: details.website,
+        mapsUrl: details.url,
+        businessType,
+        location,
+        prospectType: isBad ? "bad_website" : "found",
+        perfScore: scores?.performance,
+        mobileScore: scores?.mobile,
+        seoScore: scores?.seo,
+        pitchReason: "",
+      };
+      p.pitchReason = buildPitchReason(p);
+      await saveProspect(p);
+      results.push(p);
     }
   }
 
@@ -281,7 +302,7 @@ export async function getUnsentProspects(): Promise<Prospect[]> {
     mapsUrl: r.maps_url,
     businessType: r.business_type,
     location: r.location,
-    prospectType: r.prospect_type as "no_website" | "bad_website",
+    prospectType: r.prospect_type as ProspectType,
     perfScore: r.perf_score,
     mobileScore: r.mobile_score,
     seoScore: r.seo_score,
