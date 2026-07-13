@@ -1,4 +1,4 @@
-import { runAllProspectTargets } from "../agents/placesProspectorAgent";
+import { runAllProspectTargets, scoreProspectWebsites } from "../agents/placesProspectorAgent";
 import { deliverUnsentProspects } from "../telegram/bot";
 import { enrichProspectsWithEmails } from "../services/contactFinderService";
 import { runPendingSequences } from "../services/sequenceService";
@@ -20,9 +20,10 @@ export async function runProspectCycle(trigger: string): Promise<void> {
   try {
     const found = await runAllProspectTargets();
     const enriched = await enrichProspectsWithEmails(); // enrich before delivery so email buttons are ready
+    const scored = await scoreProspectWebsites();       // upgrade found → bad_website where applicable
     const delivered = await deliverUnsentProspects();
     const followUpsSent = await runPendingSequences();
-    log.info({ trigger, found, enriched, delivered, followUpsSent, durationMs: Date.now() - startedAt }, "Prospect cycle finished");
+    log.info({ trigger, found, enriched, scored, delivered, followUpsSent, durationMs: Date.now() - startedAt }, "Prospect cycle finished");
   } catch (err) {
     log.error({ trigger, err: (err as Error).message }, "Prospect cycle errored");
   } finally {

@@ -197,31 +197,7 @@ async function processPlace(
   const details = await getPlaceDetails(place.place_id);
   if (!details) return null;
 
-  if (!details.website) {
-    const p: Prospect = {
-      placeId: details.place_id,
-      name: details.name,
-      address: details.formatted_address,
-      phone: details.formatted_phone_number,
-      mapsUrl: details.url,
-      businessType,
-      location,
-      prospectType: "no_website",
-      pitchReason: "",
-    };
-    p.pitchReason = buildPitchReason(p);
-    await saveProspect(p);
-    return p;
-  }
-
-  // Has website — check PageSpeed in parallel with other places
-  const scores = await getPageSpeedScores(details.website);
-  const isBad = scores && (
-    scores.performance < BAD_SITE_THRESHOLD ||
-    scores.mobile < BAD_SITE_THRESHOLD ||
-    scores.seo < BAD_SITE_THRESHOLD
-  );
-
+  // Save immediately — no PageSpeed blocking. Website scoring runs in background.
   const p: Prospect = {
     placeId: details.place_id,
     name: details.name,
@@ -231,15 +207,51 @@ async function processPlace(
     mapsUrl: details.url,
     businessType,
     location,
-    prospectType: isBad ? "bad_website" : "found",
-    perfScore: scores?.performance,
-    mobileScore: scores?.mobile,
-    seoScore: scores?.seo,
+    prospectType: details.website ? "found" : "no_website",
     pitchReason: "",
   };
   p.pitchReason = buildPitchReason(p);
   await saveProspect(p);
   return p;
+}
+
+// Runs after scan to score websites and upgrade found → bad_website where needed
+export async function scoreProspectWebsites(placeIds?: string[]): Promise<number> {
+  const query = placeIds
+    ? `SELECT place_id, website FROM prospects WHERE prospect_type = 'found' AND website IS NOT NULL AND place_id = ANY($1) AND perf_score IS NULL`
+    : `SELECT place_id, website FROM prospects WHERE prospect_type = 'found' AND website IS NOT NULL AND perf_score IS NULL ORDER BY created_at DESC LIMIT 50`;
+
+  const result = await pool.query<{ place_id: string; website: string }>(
+    query,
+    placeIds ? [placeIds] : []
+  );
+
+  let upgraded = 0;
+  for (const row of result.rows) {
+    const scores = await getPageSpeedScores(row.website);
+    if (!scores) continue;
+
+    const isBad =
+      scores.performance < BAD_SITE_THRESHOLD ||
+      scores.mobile < BAD_SITE_THRESHOLD ||
+      scores.seo < BAD_SITE_THRESHOLD;
+
+    await pool.query(
+      `UPDATE prospects SET perf_score=$1, mobile_score=$2, seo_score=$3,
+        prospect_type=CASE WHEN $4 THEN 'bad_website' ELSE prospect_type END,
+        pitch_reason=CASE WHEN $4 THEN $5 ELSE pitch_reason END
+       WHERE place_id=$6`,
+      [
+        scores.performance, scores.mobile, scores.seo,
+        isBad,
+        isBad ? `Website needs work: speed ${scores.performance}/100, mobile ${scores.mobile}/100, SEO ${scores.seo}/100.` : "",
+        row.place_id,
+      ]
+    );
+    if (isBad) upgraded++;
+    await sleep(300);
+  }
+  return upgraded;
 }
 
 export async function scanProspects(
