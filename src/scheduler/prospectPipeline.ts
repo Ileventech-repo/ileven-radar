@@ -19,10 +19,10 @@ export async function runProspectCycle(trigger: string): Promise<void> {
 
   try {
     const found = await runAllProspectTargets();
+    const enriched = await enrichProspectsWithEmails(); // enrich before delivery so email buttons are ready
     const delivered = await deliverUnsentProspects();
-    const enriched = await enrichProspectsWithEmails();
     const followUpsSent = await runPendingSequences();
-    log.info({ trigger, found, delivered, enriched, followUpsSent, durationMs: Date.now() - startedAt }, "Prospect cycle finished");
+    log.info({ trigger, found, enriched, delivered, followUpsSent, durationMs: Date.now() - startedAt }, "Prospect cycle finished");
   } catch (err) {
     log.error({ trigger, err: (err as Error).message }, "Prospect cycle errored");
   } finally {

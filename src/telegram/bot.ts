@@ -147,12 +147,39 @@ function formatProspect(p: Prospect, index: number): string {
   ];
   if (p.phone) lines.push(`📞 ${esc(p.phone)}`);
   if (p.website) lines.push(`🌐 ${esc(p.website)}`);
+  if (p.contactEmail) lines.push(`✉️ ${esc(p.contactEmail)}`);
   if (p.prospectType === "bad_website" && p.perfScore !== undefined) {
     lines.push(`📊 Speed: ${p.perfScore} | Mobile: ${p.mobileScore} | SEO: ${p.seoScore}`);
   }
   if (p.mapsUrl) lines.push(`🗺 <a href="${esc(p.mapsUrl)}">Google Maps</a>`);
   lines.push(`💡 ${esc(p.pitchReason)}`);
   return lines.join("\n");
+}
+
+function buildProspectButtons(p: Prospect): TelegramBot.InlineKeyboardButton[][] {
+  const row1: TelegramBot.InlineKeyboardButton[] = [
+    { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
+  ];
+  if (callAgentEnabled && p.phone) {
+    row1.push({ text: "🤖 AI Call", callback_data: `make_call:prospect:${p.placeId}` });
+  }
+
+  const row2: TelegramBot.InlineKeyboardButton[] = [];
+  if (emailEnabled) {
+    if (p.contactEmail) {
+      // Email already found — go straight to drafting
+      row2.push({ text: "📧 Send Cold Email", callback_data: `draft_email:prospect:${p.placeId}:${p.contactEmail}` });
+    } else if (p.website) {
+      row2.push({ text: "📧 Draft Email", callback_data: `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}` });
+    } else {
+      row2.push({ text: "📧 Draft Email", callback_data: `ask_email:prospect:${p.placeId}` });
+    }
+  }
+  if (whatsappEnabled && p.phone) {
+    row2.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
+  }
+
+  return row2.length > 0 ? [row1, row2] : [row1];
 }
 
 export async function deliverUnsentProspects(): Promise<number> {
@@ -185,23 +212,7 @@ export async function deliverUnsentProspects(): Promise<number> {
             ...HTML,
             disable_web_page_preview: false,
           };
-          const row1: TelegramBot.InlineKeyboardButton[] = [
-            { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
-          ];
-          if (callAgentEnabled && p.phone) {
-            row1.push({ text: "🤖 AI Call", callback_data: `make_call:prospect:${p.placeId}` });
-          }
-          const row2: TelegramBot.InlineKeyboardButton[] = [];
-          if (emailEnabled) {
-            const cbData = p.website
-              ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
-              : `ask_email:prospect:${p.placeId}`;
-            row2.push({ text: "📧 Draft Email", callback_data: cbData });
-          }
-          if (whatsappEnabled && p.phone) {
-            row2.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
-          }
-          opts.reply_markup = { inline_keyboard: row2.length > 0 ? [row1, row2] : [row1] };
+          opts.reply_markup = { inline_keyboard: buildProspectButtons(p) };
           await withRetry(() => getBot().sendMessage(chatId, message, opts), { label: "Telegram prospect send", retries: 2 });
           await sleep(120);
         } catch (err) {
@@ -544,19 +555,7 @@ function registerCommands(b: TelegramBot): void {
       for (const p of prospects) {
         const message = formatProspect(p, 1);
         const opts: TelegramBot.SendMessageOptions = { ...HTML };
-        const scanButtons: TelegramBot.InlineKeyboardButton[] = [
-          { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
-        ];
-        if (emailEnabled) {
-          const cbData = p.website
-            ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
-            : `ask_email:prospect:${p.placeId}`;
-          scanButtons.push({ text: "📧 Draft Email", callback_data: cbData });
-        }
-        if (whatsappEnabled && p.phone) {
-          scanButtons.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
-        }
-        opts.reply_markup = { inline_keyboard: [scanButtons] };
+        opts.reply_markup = { inline_keyboard: buildProspectButtons(p) };
         await b.sendMessage(msg.chat.id, message, opts);
         await sleep(200);
       }
@@ -967,19 +966,7 @@ Return ONLY valid JSON: {"intent":"...","params":{}}`,
       } else {
         await b.sendMessage(chatId, `✅ <b>${esc(params.location)} scan done</b>\n🚫 ${noSite} no-website · ⚠️ ${badSite} bad-website`, HTML);
         for (const p of prospects) {
-          const scanBtns: TelegramBot.InlineKeyboardButton[] = [
-            { text: "📞 Call Script", callback_data: `call_script:prospect:${p.placeId}` },
-          ];
-          if (emailEnabled) {
-            const cbData = p.website
-              ? `draft_email:prospect:${p.placeId}:webmaster@${new URL(p.website).hostname}`
-              : `ask_email:prospect:${p.placeId}`;
-            scanBtns.push({ text: "📧 Draft Email", callback_data: cbData });
-          }
-          if (whatsappEnabled && p.phone) {
-            scanBtns.push({ text: "📱 WhatsApp", callback_data: `whatsapp_send:${p.placeId}:${p.phone}` });
-          }
-          await b.sendMessage(chatId, formatProspect(p, 1), { ...HTML, reply_markup: { inline_keyboard: [scanBtns] } });
+          await b.sendMessage(chatId, formatProspect(p, 1), { ...HTML, reply_markup: { inline_keyboard: buildProspectButtons(p) } });
           await sleep(200);
         }
       }

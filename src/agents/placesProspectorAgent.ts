@@ -24,6 +24,7 @@ export interface Prospect {
   mobileScore?: number;
   seoScore?: number;
   pitchReason: string;
+  contactEmail?: string;
 }
 
 interface PlaceSearchResult {
@@ -264,10 +265,11 @@ export async function getUnsentProspects(): Promise<Prospect[]> {
     place_id: string; name: string; address: string; phone: string;
     website: string; maps_url: string; business_type: string; location: string;
     prospect_type: string; perf_score: number; mobile_score: number;
-    seo_score: number; pitch_reason: string;
+    seo_score: number; pitch_reason: string; contact_email: string;
   }>(
     `SELECT place_id, name, address, phone, website, maps_url, business_type,
-            location, prospect_type, perf_score, mobile_score, seo_score, pitch_reason
+            location, prospect_type, perf_score, mobile_score, seo_score,
+            pitch_reason, contact_email
      FROM prospects WHERE telegram_sent = FALSE ORDER BY created_at ASC LIMIT 30`
   );
   return result.rows.map((r) => ({
@@ -284,6 +286,7 @@ export async function getUnsentProspects(): Promise<Prospect[]> {
     mobileScore: r.mobile_score,
     seoScore: r.seo_score,
     pitchReason: r.pitch_reason,
+    contactEmail: r.contact_email,
   }));
 }
 
